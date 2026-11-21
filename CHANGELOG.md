@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.2.0 — 2026-11-22 (mobile & details redesign)
+
+### Fixed
+- **Missing posters:** series cards now borrow (or trigger) their first episode's artwork. On-screen requests jump ahead of the background queue. Generation is ~3× cheaper: one tone-mapped 1280px JPEG serves as thumbnail and backdrop, with a fallback for files that can't seek. The page retries images that are still generating, and live updates also refresh series cards.
+- **Player taps:** the controls overlay covered the whole picture and swallowed taps and double-taps, even while hidden. It is now click-through except for real controls.
+- **Phone player bar:** on phones (portrait and landscape) and small tablets the bar shows only essentials. Speed, quality, chapters, PiP and next episode moved into the ⚙ menu, so nothing overflows. Safe-area padding for notched phones. The next-episode card is compact on landscape phones.
+- **Settings → Libraries on phones:** folder rows stack instead of wrapping the path one letter per line.
+- **Font sizes:** fixed steps (16px desktop, 15px ≤1200px, 14px phones, 22px TV) instead of viewport-width scaling. Smaller headings on phones.
+
+### Changed
+- **Double-tap / double-click on the video:** centre toggles fullscreen (browser bars hidden, landscape lock on phones), left and right seek ∓10 s and add up with repeated taps. On iPhone, native fullscreen keeps the selected subtitles.
+- **Details page redesign** (movies, episodes, series): full-bleed hero, Play / Resume / Start over with round My List and Watched buttons, metadata row with quality badges and remaining time, episode rows with thumbnails, progress and synopsis, a season picker, "More like this", and an "About" section. Full-screen layout on phones. The chapters section was removed from the page; chapters are still available in the player.
+
 ## 1.1.0 — 2026-11-21 (library scope)
 
 ### Added
