@@ -1,1 +1,7 @@
 PRD.md
+__pycache__/
+*.pyc
+output/
+smoke/
+web/
+.claude/

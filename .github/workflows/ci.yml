@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.10", "3.13"]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install ffmpeg (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Install ffmpeg (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg
+
+      - name: Install ffmpeg (Windows)
+        if: runner.os == 'Windows'
+        run: choco install ffmpeg -y --no-progress
+
+      - name: Compile
+        run: python -m py_compile localflix.py
+
+      - name: Lint
+        if: matrix.python == '3.13' && runner.os == 'Linux'
+        run: |
+          python -m pip install ruff flake8
+          ruff check --isolated localflix.py
+          flake8 localflix.py
+
+      - name: Self-test
+        run: python localflix.py --selftest
+
+      - name: Doctor
+        run: python localflix.py doctor
+        continue-on-error: true
+
+      - name: Smoke test (server + HLS client)
+        shell: bash
+        run: |
+          set -e
+          mkdir -p smoke/media smoke/home
+          python localflix.py --home smoke/home fixtures smoke/media --small
+          python localflix.py --home smoke/home serve --no-open --no-wizard -f smoke/media -p 8899 --host 127.0.0.1 &
+          SERVER=$!
+          for i in $(seq 1 60); do curl -sf http://127.0.0.1:8899/api/v1/system/info >/dev/null && break; sleep 1; done
+          curl -sf http://127.0.0.1:8899/ >/dev/null
+          curl -sf http://127.0.0.1:8899/api/v1/system/info
+          sleep 8
+          python - <<'EOF'
+          import json, subprocess, urllib.request
+          base = "http://127.0.0.1:8899/api/v1"
+          items = json.load(urllib.request.urlopen(base + "/items?limit=100"))["items"]
+          target = next(i for i in items if "Multi" in i["title"])
+          req = urllib.request.Request(base + f"/items/{target['id']}/playback", method="POST",
+                                       data=json.dumps({"video": ["h264"], "audio": ["aac"], "containers": ["mp4"]}).encode(),
+                                       headers={"Content-Type": "application/json"})
+          pb = json.load(urllib.request.urlopen(req))
+          print("decision:", pb["method"], pb["reason"])
+          url = "http://127.0.0.1:8899" + pb["url"]
+          r = subprocess.run(["ffmpeg", "-v", "error", "-t", "10", "-i", url, "-f", "null", "-"], timeout=120)
+          assert r.returncode == 0, "HLS playback through ffmpeg failed"
+          print("HLS client OK")
+          EOF
+          kill $SERVER || true
