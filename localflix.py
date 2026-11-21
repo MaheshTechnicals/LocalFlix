@@ -59,6 +59,7 @@ import unittest
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 import webbrowser
 from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
@@ -79,8 +80,8 @@ if sys.version_info < (3, 10):  # noqa: UP036  # pragma: no cover
 
 # ===== SECTION: constants =====
 APP_NAME = "LocalFlix"
-VERSION = "1.0.0"
-SCHEMA_VERSION = 3
+VERSION = "1.1.0"
+SCHEMA_VERSION = 4
 HLSJS_VERSION = "1.7.4"  # resolved from the npm registry on 2026-11-21
 HLSJS_SHA384 = "p9vgU/7IYJWd3I4STrtqxqR/2cAQlhIX7D/HrTnIMEjjcUox165b7se7sxmm3zDg"
 HLSJS_URLS = [
@@ -564,6 +565,224 @@ class SleepInhibitor:
             pass
 
 
+# ===== SECTION: media-discovery =====
+# Folder names skipped inside *auto-discovered* libraries (case-insensitive). User-added folders are only
+# subject to SKIP_DIRS / hidden-file rules, because the user chose them explicitly.
+AUTO_EXCLUDE_NAMES = {
+    # Windows system / app data
+    "windows", "program files", "program files (x86)", "programdata", "appdata", "$recycle.bin", "$windows.~bt",
+    "$windows.~ws", "$winreagent", "system volume information", "recovery", "perflogs", "msocache", "intel", "amd",
+    "nvidia", "drivers", "onedrivetemp", "windowsapps", "packages", "msys64", "cygwin64",
+    # macOS
+    "library", "applications", "system", "private", "cores", ".trash", ".trashes", ".spotlight-v100", ".fseventsd",
+    ".documentrevisions-v100", ".temporaryitems",
+    # Linux / dev / app caches
+    "proc", "sys", "dev", "run", "boot", "etc", "usr", "bin", "sbin", "lib", "lib64", "var", "tmp", "snap",
+    "lost+found", "node_modules", "site-packages", "dist-packages", "__pycache__", ".git", ".svn", ".cache",
+    ".local", ".var", ".npm", ".cargo", ".rustup", ".gradle", ".m2", ".android", ".wine", ".steam", "steamapps",
+    "steamlibrary", "anaconda3", "miniconda3", "venv", ".venv", "go", "flatpak",
+    # Android shared storage
+    "android", ".thumbnails", ".statuses",
+}
+AUTO_EXCLUDE_GLOBS = ("*.app", "*.photoslibrary", "*.bundle", "*.framework", "*.lrlibrary", "*.fcpbundle",
+                      "*.imovielibrary", "*.tvlibrary", "*.photolibrary", "*.aplibrary")
+
+
+def _user_dirs_xdg(key: str) -> Path | None:
+    """Resolve an XDG user directory (e.g. XDG_VIDEOS_DIR) from ~/.config/user-dirs.dirs."""
+    cfg = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "user-dirs.dirs"
+    try:
+        for line in cfg.read_text(encoding="utf-8", errors="ignore").splitlines():
+            m = re.match(rf'\s*{key}\s*=\s*"(.*)"', line)
+            if m:
+                return Path(m.group(1).replace("$HOME", str(Path.home())))
+    except OSError:
+        pass
+    return None
+
+
+def _windows_known_folder(guid: str) -> Path | None:
+    """SHGetKnownFolderPath (handles redirected / OneDrive-backed Videos & Downloads)."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class GUID(ctypes.Structure):
+            _fields_ = [("d1", wintypes.DWORD), ("d2", wintypes.WORD), ("d3", wintypes.WORD), ("d4", ctypes.c_ubyte * 8)]
+        g = uuid.UUID(guid)
+        gg = GUID(g.fields[0], g.fields[1], g.fields[2], (ctypes.c_ubyte * 8)(*g.bytes[8:]))
+        out = ctypes.c_wchar_p()
+        if ctypes.windll.shell32.SHGetKnownFolderPath(ctypes.byref(gg), 0, None, ctypes.byref(out)) == 0:  # type: ignore[attr-defined]
+            val = out.value
+            ctypes.windll.ole32.CoTaskMemFree(out)  # type: ignore[attr-defined]
+            return Path(val) if val else None
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def _windows_drives() -> list[Path]:
+    """Fixed and removable drive roots (network, CD and RAM drives are skipped)."""
+    out: list[Path] = []
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        mask = k32.GetLogicalDrives()
+        for i in range(26):
+            if mask & (1 << i):
+                root = f"{chr(65 + i)}:\\"
+                if k32.GetDriveTypeW(ctypes.c_wchar_p(root)) in (2, 3):  # DRIVE_REMOVABLE, DRIVE_FIXED
+                    out.append(Path(root))
+    except Exception:  # noqa: BLE001
+        import string
+        out = [Path(f"{d}:\\") for d in string.ascii_uppercase if os.path.exists(f"{d}:\\")]
+    return out
+
+
+def _children(d: Path) -> list[Path]:
+    try:
+        return sorted(Path(e.path) for e in os.scandir(d) if e.is_dir() and not e.name.startswith("."))
+    except OSError:
+        return []
+
+
+def _mounted_drives() -> list[tuple[Path, str]]:
+    """External / secondary drives currently mounted (USB disks, SD cards, NAS mounts under /mnt)."""
+    found: list[tuple[Path, str]] = []
+    user = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
+    if PLAT.is_windows:
+        sysdrive = (os.environ.get("SystemDrive") or "C:").upper()
+        for d in _windows_drives():
+            if not str(d).upper().startswith(sysdrive):
+                found.append((d, f"Drive {str(d)[:2]}"))
+    elif PLAT.is_mac:
+        for d in _children(Path("/Volumes")):
+            with contextlib.suppress(OSError):
+                if d.is_symlink() or d.resolve() == Path("/"):
+                    continue  # the boot volume ("Macintosh HD" → /)
+                found.append((d, d.name))
+    elif PLAT.is_termux:
+        for d in _children(Path.home() / "storage"):
+            if d.name.startswith("external"):
+                found.append((d, "SD card"))
+        for d in _children(Path("/storage")):
+            if d.name not in ("emulated", "self") and re.fullmatch(r"[0-9A-F]{4}-[0-9A-F]{4}", d.name, re.IGNORECASE):
+                found.append((d, f"SD card {d.name}"))
+    else:
+        bases = [Path("/media") / user, Path("/run/media") / user] if user else []
+        for base in bases:
+            for d in _children(base):
+                found.append((d, d.name))
+        for base in (Path("/media"), Path("/mnt")):
+            for d in _children(base):
+                if base == Path("/media") and d.name == user:
+                    continue
+                if PLAT.is_wsl and base == Path("/mnt") and re.fullmatch(r"[a-z]", d.name):
+                    continue  # Windows drives under WSL are handled separately
+                if d.name in ("wsl", "wslg") or (PLAT.is_docker and d.name in ("", )):
+                    continue
+                found.append((d, d.name))
+    return found
+
+
+def discover_media_roots(scope: str) -> list[dict[str, str]]:
+    """Folders LocalFlix should index automatically for a library scope.
+
+    ``folders``: nothing (only user-added folders) · ``common``: the platform's standard video folders plus
+    external drives · ``all``: ``common`` plus the whole home folder and every drive (system folders are
+    excluded while walking). Every returned path exists and is readable; nested duplicates are kept on purpose
+    (the deepest library owns a file, which keeps item ids stable when the scope changes).
+    """
+    if scope not in ("common", "all"):
+        return []
+    home = Path.home()
+    cands: list[tuple[Path, str, str]] = []  # (path, key, label)
+
+    def add(p: Path | None, key: str, label: str) -> None:
+        if p is not None:
+            cands.append((p, key, label))
+
+    if PLAT.is_windows:
+        add(_windows_known_folder("18989B1D-99B5-455B-841C-AB7C74E4DDFC") or home / "Videos", "videos", "Videos")
+        add(_windows_known_folder("374DE290-123F-4565-9164-39C4925E467B") or home / "Downloads", "downloads", "Downloads")
+        add(Path(os.environ.get("PUBLIC") or r"C:\Users\Public") / "Videos", "public-videos", "Public Videos")
+        od = os.environ.get("OneDrive")
+        if od:
+            add(Path(od) / "Videos", "onedrive-videos", "OneDrive Videos")
+    elif PLAT.is_mac:
+        add(home / "Movies", "movies", "Movies")
+        add(home / "Downloads", "downloads", "Downloads")
+    elif PLAT.is_termux:
+        shared = home / "storage" / "shared"
+        if not shared.exists() and os.access("/sdcard", os.R_OK):
+            shared = Path("/sdcard")
+        for sub, label in (("Movies", "Movies"), ("Download", "Downloads"), ("DCIM", "Camera"),
+                           ("Videos", "Videos"), ("Telegram", "Telegram"),
+                           ("Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Video", "WhatsApp Video"),
+                           ("WhatsApp/Media/WhatsApp Video", "WhatsApp Video")):
+            add(shared / sub, "android-" + sub.lower().split("/")[-1].replace(" ", "-"), label)
+    else:
+        if PLAT.is_docker:
+            add(Path("/media"), "docker-media", "Media")
+        add(_user_dirs_xdg("XDG_VIDEOS_DIR") or home / "Videos", "videos", "Videos")
+        add(_user_dirs_xdg("XDG_DOWNLOAD_DIR") or home / "Downloads", "downloads", "Downloads")
+        if PLAT.is_wsl:
+            for u in _children(Path("/mnt/c/Users")):
+                if u.name.lower() in ("public", "default", "default user", "all users"):
+                    continue
+                add(u / "Videos", f"win-videos-{u.name.lower()}", f"Windows Videos ({u.name})")
+                add(u / "Downloads", f"win-downloads-{u.name.lower()}", f"Windows Downloads ({u.name})")
+    for d, label in _mounted_drives():
+        add(d, "drive:" + str(d), label)
+    if scope == "all":
+        if PLAT.is_windows:
+            for d in _windows_drives():
+                add(d, "drive:" + str(d), f"Drive {str(d)[:2]}")
+        elif PLAT.is_termux:
+            shared = home / "storage" / "shared"
+            add(shared if shared.exists() else Path("/sdcard"), "android-shared", "Internal storage")
+        else:
+            add(home, "home", "Home folder")
+            if PLAT.is_wsl:
+                for d in _children(Path("/mnt")):
+                    if re.fullmatch(r"[a-z]", d.name):
+                        add(d, f"drive:{d}", f"Windows drive {d.name.upper()}:")
+            for extra in (Path("/srv"), Path("/data"), Path("/home") if PLAT.is_linux else None):
+                if extra is not None and extra != home and not home.is_relative_to(extra):
+                    add(extra, f"dir:{extra}", str(extra))
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for p, key, label in cands:
+        try:
+            rp = p.resolve()
+        except OSError:
+            continue
+        norm = os.path.normcase(str(rp))
+        if norm in seen or not rp.is_dir() or not os.access(rp, os.R_OK | os.X_OK):
+            continue
+        seen.add(norm)
+        out.append({"path": str(rp), "key": key, "label": label})
+    return out
+
+
+def looks_like_mpegts(path: str) -> bool:
+    """``.ts`` is also TypeScript: accept only real MPEG transport streams (sync byte 0x47 every 188/192 bytes)."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(192 * 4)
+    except OSError:
+        return False
+    for pkt, off in ((188, 0), (192, 4)):
+        if len(head) >= off + pkt * 3 and all(head[off + i * pkt] == 0x47 for i in range(3)):
+            return True
+    return False
+
+
+def auto_excluded(name: str) -> bool:
+    low = name.lower()
+    return low in AUTO_EXCLUDE_NAMES or any(fnmatch.fnmatch(low, g) for g in AUTO_EXCLUDE_GLOBS)
+
+
 # ===== SECTION: logging =====
 log = logging.getLogger("localflix")
 
@@ -661,6 +880,12 @@ SETTINGS_SPEC: list[dict[str, Any]] = [
       help="Glob patterns to ignore (case-insensitive)"),
     S("include_hidden", False, "bool", "libraries", help="Index hidden files and folders"),
     S("purge_days", 7, "int", "libraries", min=0, max=365, help="Days before missing files are purged"),
+    S("library_scope", "folders", "enum", "libraries", admin=True, choices=["folders", "common", "all"],
+      help="Which videos to index: only your folders, the usual video folders + USB drives, or the whole computer"),
+    S("auto_scan_interval", 1800, "int", "libraries", admin=True, min=0, max=86400,
+      help="Seconds between scans of auto-detected folders (0 = manual). They can be very large"),
+    S("auto_min_size_mb", 2, "int", "libraries", admin=True, min=0, max=1000,
+      help="Skip smaller files in auto-detected folders (app sounds, ads, thumbnails)"),
     # Playback
     S("audio_lang", "eng", "str", "playback", "user", help="Preferred audio language (ISO code)", maxlen=12),
     S("audio_lang_fallback", ["hin", "eng"], "list", "playback", "user", help="Fallback audio languages"),
@@ -853,7 +1078,15 @@ def _mig_3(conn: sqlite3.Connection, fts: bool) -> None:
         conn.execute("ALTER TABLE items ADD COLUMN subs_external INTEGER DEFAULT 0")
 
 
-MIGRATIONS.extend([_mig_1, _mig_2, _mig_3])
+def _mig_4(conn: sqlite3.Connection, fts: bool) -> None:
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(libraries)")}
+    for name, ddl in (("source", "TEXT NOT NULL DEFAULT 'user'"), ("auto_key", "TEXT"), ("last_scan", "REAL"),
+                      ("offline", "INTEGER NOT NULL DEFAULT 0"), ("user_disabled", "INTEGER NOT NULL DEFAULT 0")):
+        if name not in cols:
+            conn.execute(f"ALTER TABLE libraries ADD COLUMN {name} {ddl}")
+
+
+MIGRATIONS.extend([_mig_1, _mig_2, _mig_3, _mig_4])
 
 
 def has_fts5() -> bool:
@@ -1906,6 +2139,7 @@ class Scanner:
         self._kf_running: set[str] = set()
         self._kf_q: queue.Queue[tuple[str, Path, Path]] = queue.Queue()
         self._kf_thread: threading.Thread | None = None
+        self._manual = False
 
     def start(self) -> None:
         t = threading.Thread(target=self._loop, name="scanner", daemon=True)
@@ -1925,33 +2159,80 @@ class Scanner:
 
     def trigger(self, full: bool = False) -> None:
         self._full = self._full or full
+        self._manual = True
         self._wake.set()
 
     def _loop(self) -> None:
         first = True
         while not self._stop.is_set():
             if not first:
-                interval = int(self.app.setting("scan_interval") or 0)
-                self._wake.wait(timeout=interval if interval > 0 else None)
-            first = False
+                user_iv = int(self.app.setting("scan_interval") or 0)
+                auto_iv = int(self.app.setting("auto_scan_interval") or 0)
+                ivs = [i for i in (user_iv, auto_iv) if i > 0]
+                if self.app.setting("library_scope") != "folders":
+                    ivs.append(60)  # cheap mount check: picks up USB drives / SD cards as they appear
+                self._wake.wait(timeout=min(ivs) if ivs else None)
             if self._stop.is_set():
                 break
+            manual = first or self._manual
+            first = False
             self._wake.clear()
+            self._manual = False
             full, self._full = self._full, False
             try:
-                self.scan_all(full)
+                self.scan_all(full, manual=manual)
             except Exception:  # pragma: no cover
                 log.exception("scan failed")
 
-    def scan_all(self, full: bool = False) -> None:
+    # --- auto-discovered libraries ------------------------------------------
+    def sync_auto_libraries(self) -> bool:
+        """Create/enable/disable auto libraries for the current scope and refresh offline flags."""
+        scope = str(self.app.setting("library_scope") or "folders")
+        desired = {os.path.normcase(d["path"]): d for d in discover_media_roots(scope)}
+        changed = False
+        with self.db.tx() as conn:
+            rows = conn.execute("SELECT * FROM libraries").fetchall()
+            by_path = {os.path.normcase(r["path"]): r for r in rows}
+            for norm, d in desired.items():
+                r = by_path.get(norm)
+                if r is None:
+                    conn.execute("INSERT INTO libraries(path,type,name,enabled,added_at,source,auto_key) "
+                                 "VALUES(?,?,?,1,?,'auto',?)", (d["path"], "mixed", d["label"], time.time(), d["key"]))
+                    changed = True
+                elif r["source"] == "auto" and not r["enabled"] and not r["user_disabled"]:
+                    conn.execute("UPDATE libraries SET enabled=1 WHERE id=?", (r["id"],))
+                    changed = True
+            for r in rows:
+                if r["source"] == "auto" and r["enabled"] and os.path.normcase(r["path"]) not in desired:
+                    conn.execute("UPDATE libraries SET enabled=0 WHERE id=?", (r["id"],))  # kept: ids stay stable
+                    changed = True
+            for r in conn.execute("SELECT id, path, offline FROM libraries WHERE enabled=1").fetchall():
+                off = int(not (os.path.isdir(r["path"]) and os.access(r["path"], os.R_OK)))
+                if off != r["offline"]:
+                    conn.execute("UPDATE libraries SET offline=? WHERE id=?", (off, r["id"]))
+                    changed = True
+        if changed:
+            self.app.events.publish("library.updated", {"libraries": True})
+        return changed
+
+    def _due(self, lib: sqlite3.Row, now: float) -> bool:
+        iv = int(self.app.setting("auto_scan_interval" if lib["source"] == "auto" else "scan_interval") or 0)
+        if lib["last_scan"] is None:
+            return True
+        return iv > 0 and now - lib["last_scan"] >= iv - 1
+
+    def scan_all(self, full: bool = False, manual: bool = True) -> None:
         self.scanning = True
         self.status.update(state="scanning", errors=[], found=0)
         self.app.events.publish("scan.progress", {"state": "scanning", "found": 0})
         t0 = time.time()
         changed = False
         try:
-            for lib in self.db.q("SELECT * FROM libraries WHERE enabled=1"):
-                changed |= self.scan_library(lib, full)
+            changed |= self.sync_auto_libraries()
+            libs = self.db.q("SELECT * FROM libraries WHERE enabled=1 ORDER BY length(path) DESC")
+            for lib in libs:
+                if manual or full or self._due(lib, t0):
+                    changed |= self.scan_library(lib, full)
             self._cleanup_series()
         finally:
             self.scanning = False
@@ -1962,13 +2243,27 @@ class Scanner:
                 self.app.events.publish("library.updated", {})
         log.info("Scan finished in %.2fs (%d files)", time.time() - t0, self.status["found"])
 
-    def _walk(self, root: Path) -> Iterator[tuple[str, int, int]]:
+    def _skip_roots(self, root_real: Path, lib_id: int) -> set[str]:
+        """Folders inside this root owned by another library (deepest root wins) + LocalFlix's own data."""
+        out: set[str] = set()
+        for r in self.db.q("SELECT id, path FROM libraries WHERE enabled=1 AND id<>?", (lib_id,)):
+            p = Path(r["path"])
+            if p != root_real and p.is_relative_to(root_real):
+                out.add(os.path.normcase(str(p)))
+        for own in (self.app.paths.config, self.app.paths.cache, SCRIPT_DIR / ".git"):
+            with contextlib.suppress(OSError):
+                out.add(os.path.normcase(str(own.resolve())))
+        return out
+
+    def _walk(self, root: Path, lib_id: int = 0, auto: bool = False) -> Iterator[tuple[str, int, int]]:
         include_hidden = bool(self.app.setting("include_hidden"))
         patterns = [p.lower() for p in (self.app.setting("ignore_patterns") or [])]
+        min_size = int(self.app.setting("auto_min_size_mb") or 0) * 1024 * 1024 if auto else 0
         try:
             root_real = root.resolve()
         except OSError:
             root_real = root
+        skip = self._skip_roots(root_real, lib_id)
         visited: set[tuple[int, int]] = set()
         stack = [root]
         while stack:
@@ -2010,6 +2305,11 @@ class Scanner:
                             if real != root_real and not real.is_relative_to(root_real):
                                 continue
                         if e.is_dir(follow_symlinks=True):
+                            if auto and auto_excluded(name):
+                                continue
+                            dp = os.path.normcase(e.path)
+                            if dp in skip or (e.is_symlink() and os.path.normcase(str(Path(e.path).resolve())) in skip):
+                                continue
                             stack.append(Path(e.path))
                             continue
                         if not e.is_file(follow_symlinks=True):
@@ -2025,6 +2325,10 @@ class Scanner:
                         st = e.stat()
                     except OSError:
                         continue
+                    if st.st_size < min_size:
+                        continue
+                    if ext in (".ts", ".mts", ".m2ts") and not looks_like_mpegts(e.path):
+                        continue
                     rel = Path(e.path).relative_to(root).as_posix() if not PLAT.is_windows else \
                         os.path.relpath(e.path.replace("\\\\?\\", ""), str(root)).replace("\\", "/")
                     if any(fnmatch.fnmatch(rel.lower(), p) for p in patterns if "/" in p):
@@ -2033,10 +2337,14 @@ class Scanner:
 
     def scan_library(self, lib: sqlite3.Row, full: bool = False) -> bool:
         root = Path(lib["path"])
-        if not root.exists():
-            self.status["errors"].append(f"Folder not found: {root}")
+        if not root.is_dir() or not os.access(root, os.R_OK):
+            # unplugged drive / unmounted share / revoked permission: hide its items but never mark them missing
+            self.status["errors"].append(f"Folder not available: {root}")
             if PLAT.is_termux and ("/storage" in str(root) or "storage/" in str(root)):
                 self.status["errors"].append("Run `termux-setup-storage` to grant storage access")
+            if not lib["offline"]:
+                self.db.x("UPDATE libraries SET offline=1 WHERE id=?", (lib["id"],))
+                return True
             return False
         lib_id = lib["id"]
         lib_type = lib["type"] or "mixed"
@@ -2057,7 +2365,7 @@ class Scanner:
                     conn.execute(sql, args)
             batch.clear()
 
-        for rel, size, mtime_ns in self._walk(root):
+        for rel, size, mtime_ns in self._walk(root, lib_id, lib["source"] == "auto"):
             seen.add(rel)
             self.status["found"] += 1
             if self.status["found"] % 500 == 0:
@@ -2117,13 +2425,28 @@ class Scanner:
             if len(batch) >= 1000:
                 flush()
         flush()
-        # missing files
-        missing = [r["id"] for rel, r in existing.items() if rel not in seen and r["missing_at"] is None]
+        present = sum(1 for r in existing.values() if r["missing_at"] is None)
+        if not seen and present > 0:
+            # an empty mount point (drive unplugged but folder still there) must not wipe the library
+            self.status["errors"].append(f"{root} looks empty or disconnected — keeping its items")
+            self.db.x("UPDATE libraries SET offline=1 WHERE id=?", (lib_id,))
+            return True
+        # missing files (a file now owned by a deeper library is adopted: watch history moves with it)
+        missing = [(rel, r["id"]) for rel, r in existing.items() if rel not in seen and r["missing_at"] is None]
         if missing:
             changed = True
             with self.db.tx() as conn:
-                for iid in missing:
-                    conn.execute("UPDATE items SET missing_at=? WHERE id=?", (now, iid))
+                for rel, iid in missing:
+                    new_id = self._owner_of(conn, root / rel, lib_id)
+                    if new_id:
+                        for tbl in ("watch_state", "mylist"):
+                            conn.execute(f"UPDATE OR IGNORE {tbl} SET item_id=? WHERE item_id=?", (new_id, iid))
+                        conn.execute("DELETE FROM items WHERE id=?", (iid,))
+                        if self.db.fts:
+                            conn.execute("DELETE FROM fts_items WHERE id=?", (iid,))
+                        conn.execute("DELETE FROM artwork WHERE item_id=?", (iid,))
+                    else:
+                        conn.execute("UPDATE items SET missing_at=? WHERE id=?", (now, iid))
         purge_days = int(self.app.setting("purge_days") or 0)
         cutoff = now - purge_days * 86400
         gone = [r[0] for r in self.db.q("SELECT id FROM items WHERE library_id=? AND missing_at IS NOT NULL AND "
@@ -2140,9 +2463,30 @@ class Scanner:
                 for f in self.app.paths.images.glob(f"{iid}_*"):
                     with contextlib.suppress(OSError):
                         f.unlink()
+        self.db.x("UPDATE libraries SET last_scan=?, offline=0 WHERE id=?", (now, lib_id))
+        if lib["offline"]:
+            changed = True
         for iid in to_probe:
             self.enqueue_probe(iid)
         return changed
+
+    @staticmethod
+    def _owner_of(conn: sqlite3.Connection, abs_path: Path, not_lib: int) -> str | None:
+        """Id of a present item in another library that is the same file (nested library took it over)."""
+        try:
+            if not abs_path.exists():
+                return None
+        except OSError:
+            return None
+        for r in conn.execute("SELECT id, path FROM libraries WHERE enabled=1 AND id<>?", (not_lib,)).fetchall():
+            lp = Path(r["path"])
+            if abs_path.is_relative_to(lp):
+                rel = abs_path.relative_to(lp).as_posix()
+                row = conn.execute("SELECT id FROM items WHERE library_id=? AND rel_path=? AND missing_at IS NULL",
+                                   (r["id"], rel)).fetchone()
+                if row:
+                    return row[0]
+        return None
 
     def _cleanup_series(self) -> None:
         self.db.x("DELETE FROM series WHERE id NOT IN (SELECT DISTINCT series_id FROM items WHERE series_id IS NOT NULL)")
@@ -2792,7 +3136,8 @@ class Library:
 
     def base_where(self, profile: sqlite3.Row | None) -> tuple[str, list[Any]]:
         kc, ka = self._kids_clause(profile)
-        return ("i.missing_at IS NULL AND i.library_id IN (SELECT id FROM libraries WHERE enabled=1)" + kc), ka
+        return ("i.missing_at IS NULL AND i.library_id IN (SELECT id FROM libraries WHERE enabled=1 AND offline=0)"
+                + kc), ka
 
     def items(self, profile: sqlite3.Row, params: dict[str, str]) -> dict[str, Any]:
         pid = profile["id"]
@@ -5643,8 +5988,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             d = dict(r)
             d["exists"] = os.path.isdir(r["path"])
             d["readable"] = os.access(r["path"], os.R_OK)
+            d["nestedIn"] = next((o["path"] for o in self.app.db.q("SELECT path FROM libraries WHERE enabled=1 AND id<>?",
+                                                                   (r["id"],))
+                                  if Path(r["path"]).is_relative_to(Path(o["path"]))), None)
             out.append(d)
-        self.send_json({"libraries": out, "scan": self.app.scanner.status})
+        self.send_json({"libraries": out, "scan": self.app.scanner.status, "scope": self.app.setting("library_scope")})
+
+    @route("GET", r"/api/v1/libraries/discover", admin=True)
+    def h_lib_discover(self) -> None:
+        scope = self.qs.get("scope") or str(self.app.setting("library_scope"))
+        if scope not in ("folders", "common", "all"):
+            raise HTTPError(400, "bad_scope", "scope must be folders, common or all")
+        self.send_json({"scope": scope, "folders": discover_media_roots(scope)})
 
     @route("POST", r"/api/v1/libraries", admin=True)
     def h_lib_add(self) -> None:
@@ -5661,11 +6016,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             raise HTTPError(400, "unreadable", "Folder is not readable" +
                             (" — run termux-setup-storage" if PLAT.is_termux else ""))
         typ = b.get("type") if b.get("type") in ("mixed", "movies", "shows") else "mixed"
-        try:
-            self.app.db.x("INSERT INTO libraries(path,type,name,enabled,added_at) VALUES(?,?,?,1,?)",
-                          (str(p.resolve()), typ, str(b.get("name") or p.name)[:60], time.time()))
-        except sqlite3.IntegrityError:
-            raise HTTPError(409, "exists", "Folder already added") from None
+        rp = str(p.resolve())
+        ex = self.app.db.one("SELECT * FROM libraries WHERE path=?", (rp,))
+        if ex is not None and ex["source"] == "user" and ex["enabled"]:
+            raise HTTPError(409, "exists", "Folder already added")
+        if ex is not None:  # auto-detected or disabled folder: becomes a regular user folder
+            self.app.db.x("UPDATE libraries SET source='user', enabled=1, user_disabled=0, type=? WHERE id=?",
+                          (typ, ex["id"]))
+        else:
+            self.app.db.x("INSERT INTO libraries(path,type,name,enabled,added_at,source) VALUES(?,?,?,1,?,'user')",
+                          (rp, typ, str(b.get("name") or p.name)[:60], time.time()))
         self.app.scanner.trigger()
         self.send_json({"ok": True}, 201)
 
@@ -5674,7 +6034,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         b = self.body()
         db = self.app.db
         if "enabled" in b:
-            db.x("UPDATE libraries SET enabled=? WHERE id=?", (int(bool(b["enabled"])), int(lid)))
+            en = int(bool(b["enabled"]))
+            # for auto folders remember the user's choice so discovery never re-enables them
+            db.x("UPDATE libraries SET enabled=?, user_disabled=CASE WHEN source='auto' THEN ? ELSE 0 END WHERE id=?",
+                 (en, 1 - en, int(lid)))
+            if en:
+                self.app.scanner.trigger()
         if b.get("type") in ("mixed", "movies", "shows"):
             db.x("UPDATE libraries SET type=? WHERE id=?", (b["type"], int(lid)))
             self.app.scanner.trigger(full=True)
@@ -5686,6 +6051,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
     @route("DELETE", r"/api/v1/libraries/(\d+)", admin=True)
     def h_lib_del(self, lid: str) -> None:
         db = self.app.db
+        row = db.one("SELECT source FROM libraries WHERE id=?", (int(lid),))
+        if row is not None and row["source"] == "auto":
+            # auto folders would be rediscovered: hide instead (keeps watch history if re-enabled)
+            db.x("UPDATE libraries SET enabled=0, user_disabled=1 WHERE id=?", (int(lid),))
+            self.app.events.publish("library.updated", {})
+            return self.send_json({"ok": True, "disabled": True})
         if db.fts:
             db.x("DELETE FROM fts_items WHERE id IN (SELECT id FROM items WHERE library_id=?)", (int(lid),))
         db.x("DELETE FROM libraries WHERE id=?", (int(lid),))
@@ -6157,6 +6528,8 @@ class App:
         if changed.get("tmdb_key"):
             for r in self.db.q("SELECT id FROM items WHERE missing_at IS NULL AND tmdb_id IS NULL"):
                 self.tmdb.enqueue(r[0])
+        if "library_scope" in changed or "auto_min_size_mb" in changed:
+            self.scanner.trigger()
         if "library_mode" in changed or "ignore_patterns" in changed or "include_hidden" in changed:
             self.scanner.trigger(full=True)
         if "scan_interval" in changed:
@@ -6230,13 +6603,15 @@ class App:
                 p.mkdir(parents=True, exist_ok=True)
                 self.db.x("INSERT OR IGNORE INTO libraries(path,type,name,enabled,added_at) VALUES(?,?,?,1,?)",
                           (str(p), "mixed", p.name, time.time()))
-                self.db.x("UPDATE libraries SET enabled=1 WHERE path=?", (str(p),))
-        if self.db.one("SELECT COUNT(*) FROM libraries")[0] == 0:
+                self.db.x("UPDATE libraries SET enabled=1, source='user', user_disabled=0 WHERE path=?", (str(p),))
+        if self.db.one("SELECT COUNT(*) FROM libraries")[0] == 0 and not self.db.kv_get("default_lib_added"):
+            # first run: exactly one folder (./output); more via Settings → Libraries or the library scope
             p = default_media_dir()
             with contextlib.suppress(OSError):
                 p.mkdir(parents=True, exist_ok=True)
             self.db.x("INSERT OR IGNORE INTO libraries(path,type,name,enabled,added_at) VALUES(?,?,?,1,?)",
                       (str(p.resolve()), "mixed", "Videos", time.time()))
+        self.db.kv_set("default_lib_added", "1")
         if self.db.one("SELECT COUNT(*) FROM profiles")[0] == 0:
             self.db.x("INSERT INTO profiles(name,avatar,kids,created_at) VALUES(?,?,0,?)", ("Me", "a1", time.time()))
 
@@ -6424,6 +6799,15 @@ def run_wizard(paths: Paths) -> None:
             p.mkdir(parents=True, exist_ok=True)
         db.x("INSERT OR IGNORE INTO libraries(path,type,name,enabled,added_at) VALUES(?,?,?,1,?)",
              (str(p), "mixed", p.name, time.time()))
+    db.kv_set("default_lib_added", "1")
+    common = discover_media_roots("common")
+    every = discover_media_roots("all")
+    print("\n  Which videos should LocalFlix show?")
+    print("    1) Only the folder(s) above  (recommended to start)")
+    print(f"    2) Also the usual video folders + USB drives  ({', '.join(d['label'] for d in common) or 'none found'})")
+    print(f"    3) Every video on this computer  ({len(every)} locations, system folders skipped)")
+    choice = _ask("Choose 1, 2 or 3", "1")
+    db.set_setting("library_scope", {"2": "common", "3": "all"}.get(choice.strip(), "folders"))
     # 3. port, language, PIN
     port = _ask("Port", str(db.get_setting("port")))
     with contextlib.suppress(ValueError):
@@ -7192,11 +7576,145 @@ class TestServerAPI(unittest.TestCase):
         self.assertEqual(st, 200)
 
 
+class TestLibraryScope(unittest.TestCase):
+    """Auto-discovery, exclusions, nested ownership, unplugged drives and scope switching."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        base = Path(self.tmp.name)
+        self.paths = Paths(str(base / "home"))
+        self.paths.ensure()
+        self.app = App(self.paths)
+        self.app.ff.ffmpeg = self.app.ff.ffprobe = None  # no probing needed
+        self.base = base
+        self.roots: list[Path] = []  # what "discovery" returns in these tests
+        self._orig = globals()["discover_media_roots"]
+        globals()["discover_media_roots"] = lambda scope: [
+            {"path": str(r.resolve()), "key": str(r), "label": r.name} for r in self.roots if r.exists()
+        ] if scope != "folders" else []
+
+    def tearDown(self) -> None:
+        globals()["discover_media_roots"] = self._orig
+        self.app.db.close_all()
+        self.tmp.cleanup()
+
+    def mk(self, rel: str, size: int = 10) -> Path:
+        p = self.base / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"\0" * size)
+        return p
+
+    def lib(self, path: Path, source: str = "user") -> int:
+        if source == "auto":
+            self.roots.append(path)
+            self.app.db.set_setting("library_scope", "all")
+        cur = self.app.db.x("INSERT INTO libraries(path,type,name,enabled,added_at,source) VALUES(?,?,?,1,?,?)",
+                            (str(path.resolve()), "mixed", path.name, time.time(), source))
+        return int(cur.lastrowid)
+
+    def items(self, lib_id: int) -> set[str]:
+        return {r[0] for r in self.app.db.q("SELECT rel_path FROM items WHERE library_id=? AND missing_at IS NULL",
+                                            (lib_id,))}
+
+    def scan(self) -> None:
+        self.app.invalidate_settings()
+        self.app.scanner.scan_all(manual=True)
+
+    def test_discover(self) -> None:
+        discover_media_roots = self._orig
+        self.assertEqual(discover_media_roots("folders"), [])
+        for sc in ("common", "all"):
+            for d in discover_media_roots(sc):
+                self.assertTrue(Path(d["path"]).is_dir(), d)
+                self.assertTrue(d["key"] and d["label"])
+        common = {d["path"] for d in discover_media_roots("common")}
+        self.assertTrue(common <= {d["path"] for d in discover_media_roots("all")})
+        self.assertTrue(auto_excluded("AppData") and auto_excluded("node_modules") and auto_excluded("Foo.app"))
+        self.assertFalse(auto_excluded("Movies"))
+        code = self.mk("code/index.d.ts")
+        code.write_text("export declare const x: number;\n" * 50)
+        tsf = self.mk("code/real.ts")
+        tsf.write_bytes((b"\x47" + b"\0" * 187) * 4)
+        self.assertFalse(looks_like_mpegts(str(code)))
+        self.assertTrue(looks_like_mpegts(str(tsf)))
+
+    def test_exclusions_and_min_size(self) -> None:
+        root = self.base / "drive"
+        self.mk("drive/Movies/Film (2020).mkv", 3 * 1024 * 1024)
+        self.mk("drive/Movies/tiny-ad.mp4", 1000)
+        self.mk("drive/AppData/Local/intro.mp4", 3 * 1024 * 1024)
+        self.mk("drive/node_modules/x/demo.webm", 3 * 1024 * 1024)
+        auto = self.lib(root, "auto")
+        self.scan()
+        self.assertEqual(self.items(auto), {"Movies/Film (2020).mkv"})
+        self.app.db.x("UPDATE libraries SET source='user' WHERE id=?", (auto,))  # user folders: no auto rules
+        self.scan()
+        self.assertEqual(len(self.items(auto)), 4)
+
+    def test_nested_owner_and_adoption(self) -> None:
+        outer = self.base / "home2"
+        self.mk("home2/Videos/Clip.mp4")
+        self.mk("home2/Downloads/Other.mkv")
+        self.app.db.set_setting("auto_min_size_mb", 0)
+        o = self.lib(outer, "auto")
+        self.scan()
+        self.assertEqual(self.items(o), {"Videos/Clip.mp4", "Downloads/Other.mkv"})
+        old_id = self.app.db.one("SELECT id FROM items WHERE library_id=? AND rel_path='Videos/Clip.mp4'", (o,))[0]
+        self.app.ensure_defaults()  # creates profile 1
+        self.app.db.x("INSERT INTO watch_state(profile_id,item_id,position_s,duration_s,watched,last_played_at) "
+                      "VALUES(1,?,100,600,0,?)", (old_id, time.time()))
+        inner = self.lib(outer / "Videos")  # user adds the nested folder: it now owns Clip.mp4
+        self.scan()
+        self.assertEqual(self.items(inner), {"Clip.mp4"})
+        self.assertEqual(self.items(o), {"Downloads/Other.mkv"})
+        new_id = self.app.db.one("SELECT id FROM items WHERE library_id=?", (inner,))[0]
+        ws = self.app.db.one("SELECT position_s FROM watch_state WHERE item_id=?", (new_id,))
+        self.assertIsNotNone(ws, "watch history should move to the nested library's item")
+        self.assertEqual(ws[0], 100)
+
+    def test_unplugged_drive_keeps_items(self) -> None:
+        usb = self.base / "usb"
+        f = self.mk("usb/Show/Season 1/Show.S01E01.mkv")
+        lid = self.lib(usb)
+        self.scan()
+        self.assertEqual(len(self.items(lid)), 1)
+        f.unlink()  # mount point still exists but is empty (drive pulled)
+        self.scan()
+        self.assertEqual(len(self.items(lid)), 1)
+        self.assertEqual(self.app.db.one("SELECT offline FROM libraries WHERE id=?", (lid,))[0], 1)
+        shutil.rmtree(usb)  # folder gone entirely
+        self.scan()
+        self.assertEqual(len(self.items(lid)), 1)
+        self.mk("usb/Show/Season 1/Show.S01E01.mkv")  # plugged back in
+        self.scan()
+        self.assertEqual(self.app.db.one("SELECT offline FROM libraries WHERE id=?", (lid,))[0], 0)
+
+    def test_scope_switch_keeps_rows(self) -> None:
+        fake = self.base / "VideosDir"
+        fake.mkdir()
+        self.roots.append(fake)
+        if True:
+            self.app.db.set_setting("library_scope", "common")
+            self.scan()
+            row = self.app.db.one("SELECT * FROM libraries WHERE source='auto'")
+            self.assertTrue(row is not None and row["enabled"])
+            self.app.db.set_setting("library_scope", "folders")
+            self.scan()
+            row2 = self.app.db.one("SELECT * FROM libraries WHERE id=?", (row["id"],))
+            self.assertEqual(row2["enabled"], 0)  # disabled, not deleted → item ids stay stable
+            self.app.db.set_setting("library_scope", "common")
+            self.scan()
+            self.assertEqual(self.app.db.one("SELECT enabled FROM libraries WHERE id=?", (row["id"],))[0], 1)
+            self.app.db.x("UPDATE libraries SET enabled=0, user_disabled=1 WHERE id=?", (row["id"],))
+            self.scan()  # a folder the user hid is never re-enabled by discovery
+            self.assertEqual(self.app.db.one("SELECT enabled FROM libraries WHERE id=?", (row["id"],))[0], 0)
+
+
 def run_selftest(verbosity: int = 2) -> int:
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
     for cls in (TestNameParser, TestHttpHelpers, TestSegments, TestDecision, TestSubtitles, TestPathSafety,
-                TestSettingsAndSchema, TestServerAPI):
+                TestSettingsAndSchema, TestLibraryScope, TestServerAPI):
         suite.addTests(loader.loadTestsFromTestCase(cls))
     res = unittest.TextTestRunner(verbosity=verbosity).run(suite)
     return 0 if res.wasSuccessful() else 1
@@ -7213,6 +7731,8 @@ def _add_serve_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--dev-web", metavar="PATH", help="serve index.html/app.css/app.js from PATH (live edit)")
     p.add_argument("--ssl-cert", help="HTTPS certificate (PEM)")
     p.add_argument("--ssl-key", help="HTTPS private key (PEM)")
+    p.add_argument("--scope", choices=["folders", "common", "all"],
+                   help="library scope (saved): only your folders, + standard video folders/USB drives, or everything")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -7261,6 +7781,9 @@ def cmd_serve(args: argparse.Namespace, paths: Paths) -> int:
     setup_logging(paths, str(app.setting("log_level") or "INFO"))
     if not args.folders and os.environ.get("LOCALFLIX_MEDIA"):
         args.folders = [os.environ["LOCALFLIX_MEDIA"]]
+    if getattr(args, "scope", None):
+        app.db.set_setting("library_scope", args.scope)
+        app.invalidate_settings()
     app.ensure_defaults(args.folders)
     port = args.port or int(os.environ.get("LOCALFLIX_PORT") or 0) or int(app.setting("port") or 8000)
     host = args.host or ("127.0.0.1" if app.setting("bind") == "localhost" else "0.0.0.0")
@@ -8035,6 +8558,12 @@ var I18N = {
   'set.urls': 'Addresses', 'set.hw': 'Hardware encoders', 'set.redetect': 'Re-detect', 'set.clearcache': 'Clear cache', 'set.doctor': 'Diagnostics', 'set.rundoctor': 'Run diagnostics',
   'set.logs': 'Server log', 'set.restartnow': 'Restart server', 'set.export': 'Export settings', 'set.import': 'Import settings', 'set.reset': 'Reset to defaults',
   'set.preview': 'The quick brown fox jumps over the lazy dog', 'set.open': 'Anyone on your Wi-Fi can use LocalFlix. Set a password to restrict access.',
+  'scope.title': 'Which videos to show', 'scope.folders': 'Only my folders', 'scope.folders.d': 'Just the folders you add below. Nothing else on this device is touched.',
+  'scope.common': 'Common video folders', 'scope.common.d': 'Videos, Movies and Downloads (phone storage on Android) plus USB drives and SD cards as they are plugged in.',
+  'scope.all': 'Entire device', 'scope.all.d': 'Every video on this computer: home folder and all drives. System and app folders are skipped. The first scan can take a while.',
+  'scope.warn': 'Everyone who can open LocalFlix on your network will see these videos. Consider setting a password.', 'scope.found': 'Detected folders',
+  'scope.none': 'No folders detected on this device', 'lib.auto': 'Auto', 'lib.custom': 'Custom', 'lib.offline': 'Not connected', 'lib.inside': 'inside {0}',
+  'lib.hide': 'Hide', 'empty.common': 'Use my video folders', 'empty.all': 'Find every video on this device',
   'set.refreshmeta': 'Refresh metadata', 'set.licenses': 'Licences', 'set.unsaved': 'Not admin — changes are disabled',
   'p.audio': 'Audio', 'p.subs': 'Subtitles', 'p.off': 'Off', 'p.speed': 'Speed', 'p.quality': 'Quality', 'p.episodes': 'Episodes', 'p.chapters': 'Chapters',
   'p.normal': 'Normal', 'p.auto': 'Auto', 'p.original': 'Original', 'p.skipintro': 'Skip Intro', 'p.skipcredits': 'Skip Credits', 'p.next': 'Next episode',
@@ -8082,6 +8611,12 @@ var I18N = {
   'set.urls': 'पते', 'set.hw': 'हार्डवेयर एन्कोडर', 'set.redetect': 'फिर से जाँचें', 'set.clearcache': 'कैश साफ़ करें', 'set.doctor': 'निदान', 'set.rundoctor': 'निदान चलाएँ',
   'set.logs': 'सर्वर लॉग', 'set.restartnow': 'सर्वर रीस्टार्ट करें', 'set.export': 'सेटिंग्स निर्यात करें', 'set.import': 'सेटिंग्स आयात करें', 'set.reset': 'डिफ़ॉल्ट पर रीसेट करें',
   'set.preview': 'यह सबटाइटल का पूर्वावलोकन है', 'set.open': 'आपके वाई-फ़ाई पर कोई भी LocalFlix का उपयोग कर सकता है। पहुँच सीमित करने के लिए पासवर्ड सेट करें।',
+  'scope.title': 'कौन-से वीडियो दिखाएँ', 'scope.folders': 'सिर्फ़ मेरे फ़ोल्डर', 'scope.folders.d': 'केवल नीचे जोड़े गए फ़ोल्डर। डिवाइस पर और कुछ नहीं छुआ जाता।',
+  'scope.common': 'सामान्य वीडियो फ़ोल्डर', 'scope.common.d': 'Videos, Movies और Downloads (Android पर फ़ोन स्टोरेज) और लगाए गए USB ड्राइव व SD कार्ड।',
+  'scope.all': 'पूरा डिवाइस', 'scope.all.d': 'इस कंप्यूटर के सभी वीडियो: होम फ़ोल्डर और सभी ड्राइव। सिस्टम और ऐप फ़ोल्डर छोड़ दिए जाते हैं। पहला स्कैन समय ले सकता है।',
+  'scope.warn': 'आपके नेटवर्क पर LocalFlix खोलने वाला हर व्यक्ति ये वीडियो देख सकेगा। पासवर्ड सेट करने पर विचार करें।', 'scope.found': 'मिले हुए फ़ोल्डर',
+  'scope.none': 'इस डिवाइस पर कोई फ़ोल्डर नहीं मिला', 'lib.auto': 'ऑटो', 'lib.custom': 'कस्टम', 'lib.offline': 'जुड़ा नहीं है', 'lib.inside': '{0} के अंदर',
+  'lib.hide': 'छिपाएँ', 'empty.common': 'मेरे वीडियो फ़ोल्डर इस्तेमाल करें', 'empty.all': 'इस डिवाइस के सभी वीडियो खोजें',
   'set.refreshmeta': 'मेटाडेटा ताज़ा करें', 'set.licenses': 'लाइसेंस', 'set.unsaved': 'एडमिन नहीं — बदलाव अक्षम हैं',
   'p.audio': 'ऑडियो', 'p.subs': 'सबटाइटल', 'p.off': 'बंद', 'p.speed': 'गति', 'p.quality': 'गुणवत्ता', 'p.episodes': 'एपिसोड', 'p.chapters': 'अध्याय',
   'p.normal': 'सामान्य', 'p.auto': 'स्वचालित', 'p.original': 'मूल', 'p.skipintro': 'इंट्रो छोड़ें', 'p.skipcredits': 'क्रेडिट छोड़ें', 'p.next': 'अगला एपिसोड',
@@ -8677,7 +9212,12 @@ function emptyLibrary() {
     dirs.map(function (d) { return h('div', h('code', d)); }),
     st && st.errors && st.errors.length ? h('p', { style: { color: 'var(--warn)' } }, st.errors.slice(0, 3).join(' · ')) : null,
     h('p', h('button.btn.btn-primary', { 'data-autofocus': true, onclick: function () { api('/library/scan', { method: 'POST', body: { full: false } }).then(function () { toast(t('toast.scan')); }); } }, icon('refresh'), t('b.rescan')),
-      S.admin ? h('a.btn.btn-ghost', { href: '#/settings/libraries' }, icon('folder'), t('set.addfolder')) : null));
+      S.admin ? h('a.btn.btn-ghost', { href: '#/settings/libraries' }, icon('folder'), t('set.addfolder')) : null),
+    S.admin ? h('p', ['common', 'all'].map(function (sc) {
+      return h('button.btn.btn-ghost', { onclick: function () {
+        api('/settings?scope=server', { method: 'PUT', body: { values: { library_scope: sc } } }).then(function () { toast(t('toast.scan'), 'ok'); });
+      } }, icon(sc === 'all' ? 'search' : 'film'), t(sc === 'all' ? 'empty.all' : 'empty.common'));
+    })) : null);
 }
 var refreshSoon = debounce(function () {
   if (S.page === 'home' && !$('.overlay') && !(LF.Player && LF.Player.active())) {
@@ -9100,7 +9640,7 @@ PAGES.settings = function (el, r) {
     S.schema = d.settings; S.admin = d.admin;
     main.appendChild(h('h2', t('set.' + cat)));
     var gate = adminGate();
-    var fields = d.settings.filter(function (s) { return s.category === cat; });
+    var fields = d.settings.filter(function (s) { return s.category === cat && s.key !== 'library_scope'; });
     var extra = SET_EXTRA[cat];
     if (gate && (cat === 'transcoding' || cat === 'network' || cat === 'libraries' || cat === 'advanced')) main.appendChild(gate);
     if (extra && extra.before) main.appendChild(extra.before());
@@ -9116,18 +9656,49 @@ var SET_EXTRA = {
   general: { after: function () { return h('div.card-box', h('b', 'LocalFlix'), h('p.muted', 'v' + BOOT.version + ' · ' + ((S.info && S.info.platform) || ''))); } },
   libraries: { before: function () {
     var box = h('div');
+    function scopeCard(cur) {
+      var preview = h('div.muted', { style: { fontSize: '.88rem', marginTop: '.6em' } });
+      function showPreview(sc) {
+        clear(preview);
+        if (sc === 'folders') return;
+        api('/libraries/discover?scope=' + sc).then(function (r) {
+          clear(preview);
+          preview.appendChild(h('b', t('scope.found') + ': '));
+          preview.appendChild(document.createTextNode(r.folders.length ? r.folders.map(function (f) { return f.label + ' (' + f.path + ')'; }).join(' · ') : t('scope.none')));
+        }).catch(function () { /* admin only */ });
+      }
+      var opts = ['folders', 'common', 'all'].map(function (sc) {
+        var b = h('button.chip' + (sc === cur ? '.on' : ''), { role: 'radio', 'aria-checked': String(sc === cur), disabled: !S.admin, style: { display: 'block', width: '100%', textAlign: 'left', borderRadius: '10px', padding: '.7em 1em', height: 'auto', marginBottom: '.5em' },
+          onclick: function () {
+            saveSetting('library_scope', sc, { scope: 'server', type: 'enum' }).then(function () { setTimeout(load, 1200); });
+            opts.forEach(function (o) { o.classList.toggle('on', o === b); o.setAttribute('aria-checked', String(o === b)); });
+            showPreview(sc); warn.classList.toggle('hidden', sc === 'folders' || (S.auth && S.auth.required));
+          } }, h('b', t('scope.' + sc)), h('div', { style: { fontSize: '.84rem', opacity: '.8', whiteSpace: 'normal' } }, t('scope.' + sc + '.d')));
+        return b;
+      });
+      var warn = h('div.banner' + (cur === 'folders' || (S.auth && S.auth.required) ? '.hidden' : ''), { style: { margin: '.6em 0 0' } }, '⚠️ ' + t('scope.warn'));
+      showPreview(cur);
+      return h('div.card-box', { role: 'radiogroup', 'aria-label': t('scope.title') }, h('b', t('scope.title')), h('div', { style: { marginTop: '.6em' } }, opts), preview, warn);
+    }
     function load() {
       api('/libraries').then(function (d) {
         clear(box);
+        box.appendChild(scopeCard(d.scope || 'folders'));
         var list = h('div.card-box');
         d.libraries.forEach(function (l) {
           var en = !!l.enabled;
           var tg = h('button.toggle', { role: 'switch', 'aria-checked': String(en), 'aria-label': 'Enabled', disabled: !S.admin, onclick: function () { en = !en; tg.setAttribute('aria-checked', String(en)); api('/libraries/' + l.id, { method: 'PATCH', body: { enabled: en } }); } });
           var typ = h('select.input', { style: { minWidth: '0', width: 'auto' }, disabled: !S.admin, onchange: function () { api('/libraries/' + l.id, { method: 'PATCH', body: { type: this.value } }).then(function () { toast(t('toast.scan')); }); } },
             [['mixed', 'Mixed'], ['movies', 'Movies'], ['shows', 'TV Shows']].map(function (o) { return h('option', { value: o[0], selected: o[0] === l.type }, o[1]); }));
-          list.appendChild(h('div.lib', icon('folder'), h('div.grow', h('b', l.path), h('small.muted', t('set.items', fmtNum(l.n)) + (l.exists ? '' : ' · ⚠ missing') + (l.readable || !l.exists ? '' : ' · ⚠ not readable'))),
+          var auto = l.source === 'auto';
+          var meta = [t('set.items', fmtNum(l.n))];
+          if (l.offline || !l.exists) meta.push('⚠ ' + t('lib.offline'));
+          else if (!l.readable) meta.push('⚠ not readable');
+          if (l.nestedIn) meta.push(t('lib.inside', l.nestedIn));
+          list.appendChild(h('div.lib' + (l.enabled ? '' : '.dis'), { style: { opacity: l.enabled ? '1' : '.55' } }, icon('folder'),
+            h('div.grow', h('b', l.name && auto ? l.name : l.path, ' ', h('span.tag', auto ? t('lib.auto') : t('lib.custom'))), h('small.muted', (auto ? l.path + ' · ' : '') + meta.join(' · '))),
             typ, h('span', { style: { width: '10px' } }), tg,
-            S.admin ? h('button.btn.btn-icon.btn-ghost', { 'aria-label': t('b.delete'), style: { marginLeft: '8px' }, onclick: function () { if (confirm(t('b.delete') + ' ' + l.path + '?')) api('/libraries/' + l.id, { method: 'DELETE' }).then(load); } }, icon('trash')) : null));
+            S.admin ? h('button.btn.btn-icon.btn-ghost', { 'aria-label': auto ? t('lib.hide') : t('b.delete'), title: auto ? t('lib.hide') : t('b.delete'), style: { marginLeft: '8px' }, onclick: function () { if (confirm((auto ? t('lib.hide') : t('b.delete')) + ' ' + l.path + '?')) api('/libraries/' + l.id, { method: 'DELETE' }).then(load); } }, icon('trash')) : null));
         });
         var st = d.scan || {};
         box.appendChild(list);

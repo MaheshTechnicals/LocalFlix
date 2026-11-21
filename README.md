@@ -78,6 +78,42 @@ Drop videos into the folder. They appear within a minute (or press **Rescan**).
 
 ---
 
+## Choosing which videos LocalFlix shows
+
+Out of the box LocalFlix indexes **one folder** only (`./output`, or whatever you pick in the wizard). Nothing else on the device is touched until you choose more in **Settings → Libraries → Which videos to show**, in the wizard, with `--scope`, or from the buttons on the empty-library screen:
+
+| Scope | What gets indexed |
+|---|---|
+| **Only my folders** (default) | Just the folders you add with *Add folder* (any path, any drive). |
+| **Common video folders** | Your platform's standard folders plus USB drives and SD cards as they are plugged in. |
+| **Entire device** | Everything above plus your whole home folder and every drive. System, app and developer folders are skipped. |
+
+Folders per platform for *Common*:
+
+| Platform | Folders |
+|---|---|
+| Windows | Videos and Downloads (real locations, including OneDrive redirection), Public Videos, OneDrive\Videos, other fixed and USB drives |
+| macOS | ~/Movies, ~/Downloads, external disks in /Volumes |
+| Linux | XDG Videos/Downloads (localised names work), /media/$USER, /run/media/$USER, /mnt. Under WSL: Windows Videos/Downloads |
+| Android (Termux) | Movies, Download, DCIM (camera), Videos, Telegram, WhatsApp Video, SD cards. Run `termux-setup-storage` once |
+
+*Entire device* adds the home folder (Linux/macOS), all fixed and removable drives (Windows; network and CD drives are skipped), the Windows drives under WSL, and internal storage (Android).
+
+```bash
+python localflix.py --scope common
+```
+
+How it behaves:
+- **Your own folders always win.** If a folder you added sits inside an auto-detected one (e.g. `~/Videos/Anime` inside the home folder), its files belong to your folder and its type (Movies / TV Shows) applies. No file is listed twice, and watch history moves along with the file.
+- **Auto folders show an *Auto* badge.** The bin icon *hides* them. Discovery never brings a hidden folder back, and its watch history is kept if you show it again.
+- **Unplugged drives and SD cards** show as *Not connected*. Their videos are hidden, not deleted, and come back with their watch history when the drive returns. New drives are picked up within about a minute.
+- **Skipped in auto folders:** system and app folders (`Windows`, `Program Files`, `AppData`, `Library`, `node_modules`, `.cache`, `Android/data`, `*.app`, photo-library packages, …), LocalFlix's own cache, and files smaller than *auto_min_size_mb* (default 2 MB: app sounds, ads, thumbnails).
+- `.ts` files are only treated as video if they really are MPEG transport streams, so TypeScript files are never indexed.
+- **Scan timing:** auto folders can be huge, so they are rescanned every *auto_scan_interval* (default 30 min) instead of every minute. *Rescan library* forces a scan now.
+- **Privacy:** with *Common* or *Entire device*, everyone who can open LocalFlix on your network sees those videos. Set a password under Network & Security if that matters.
+
+---
+
 ## Open on your TV
 
 1. Make sure the TV and the computer running LocalFlix are on the **same Wi-Fi / network**.
@@ -133,7 +169,7 @@ Double-tap left/right to skip ±10 s · tap to show controls · long-press for 2
 
 ```text
 python localflix.py                         serve (first run → setup wizard)
-python localflix.py serve -f DIR [-f DIR2] [-p PORT] [--host IP] [--no-open] [--tv] [--no-wizard]
+python localflix.py serve -f DIR [-f DIR2] [--scope folders|common|all] [-p PORT] [--host IP] [--no-open] [--tv] [--no-wizard]
                           [--dev-web PATH] [--ssl-cert FILE --ssl-key FILE]
 python localflix.py setup                   interactive wizard
 python localflix.py doctor [--full|--json]  diagnostics (also in Settings → Advanced)

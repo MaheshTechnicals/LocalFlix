@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.1.0 — 2026-11-21 (library scope)
+
+### Added
+- **Library scope** (Settings → Libraries, wizard, `--scope`, empty-library buttons):
+  - *Only my folders*: the default; a fresh install indexes just `./output`.
+  - *Common video folders*: per-platform standard folders plus USB drives and SD cards.
+  - *Entire device*: home folder and every fixed/removable drive.
+- Per-platform discovery: Windows known folders (OneDrive-aware), fixed and removable drives (network and CD drives skipped), macOS ~/Movies and /Volumes, Linux XDG dirs and /media, /run/media, /mnt, WSL Windows folders and drives, Termux shared storage, WhatsApp/Telegram folders and SD cards, Docker /media.
+- Auto libraries carry an *Auto* badge. Hiding one is remembered. Drives are detected about every minute. Unplugged drives show as *Not connected* and their items are hidden, not deleted.
+- Nested folders: the deepest library owns a file, so nothing is listed twice and watch history / My List follow a file into a newly added nested folder.
+- Exclusion rules for auto folders (system, app and developer folders, LocalFlix's own cache), `auto_min_size_mb` (default 2 MB), and `auto_scan_interval` (default 30 min).
+- `GET /api/v1/libraries/discover?scope=` previews detected folders. DB migration 4 adds the library columns `source`, `auto_key`, `last_scan`, `offline` and `user_disabled`.
+
+### Fixed
+- `.ts` files that are not MPEG transport streams (e.g. TypeScript `index.d.ts`) are no longer indexed as video.
+- An empty mount point (drive pulled but folder left behind) no longer marks a library's items as missing.
+
 ## 1.0.1 — 2026-11-21 (full code audit)
 
 ### Security
