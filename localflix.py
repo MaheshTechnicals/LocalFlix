@@ -35,6 +35,7 @@ import itertools
 import json
 import logging
 import logging.handlers
+import math
 import os
 import platform
 import queue
@@ -340,8 +341,12 @@ def popen_kwargs(low_priority: bool = True) -> dict[str, Any]:
     return kw
 
 
-def kill_tree(proc: subprocess.Popen | None) -> None:
-    """Kill a child process and all its descendants, ignoring errors."""
+def kill_tree(proc: subprocess.Popen | None, hard: bool = False) -> None:
+    """Kill a child process and all its descendants, ignoring errors.
+
+    ``hard`` sends SIGKILL right away: used for HLS encoders, because on SIGTERM ffmpeg finalises (and renames)
+    the half-written segment, which would then be served as if it were complete.
+    """
     if proc is None or proc.poll() is not None:
         return
     try:
@@ -350,7 +355,7 @@ def kill_tree(proc: subprocess.Popen | None) -> None:
                            creationflags=0x08000000, timeout=10, check=False)
         else:
             try:
-                os.killpg(proc.pid, signal.SIGTERM)
+                os.killpg(proc.pid, signal.SIGKILL if hard else signal.SIGTERM)
             except (ProcessLookupError, PermissionError):
                 proc.terminate()
             try:
@@ -507,6 +512,7 @@ class SleepInhibitor:
         self._lock = threading.Lock()
         self._count = 0
         self._proc: subprocess.Popen | None = None
+        self._win_stop: threading.Event | None = None
         self.enabled = True
 
     def acquire(self) -> None:
@@ -524,12 +530,20 @@ class SleepInhibitor:
     def _start(self) -> None:
         try:
             if PLAT.is_windows:
-                import ctypes
-                ctypes.windll.kernel32.SetThreadExecutionState(0x80000000 | 0x00000001)  # type: ignore[attr-defined]
+                # SetThreadExecutionState is per-thread: hold it on a dedicated thread for as long as needed.
+                stop = self._win_stop = threading.Event()
+
+                def hold() -> None:
+                    import ctypes
+                    k32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+                    k32.SetThreadExecutionState(0x80000000 | 0x00000001)
+                    stop.wait()
+                    k32.SetThreadExecutionState(0x80000000)
+                threading.Thread(target=hold, name="no-sleep", daemon=True).start()
+            elif PLAT.is_termux:
+                pass  # the server holds termux-wake-lock for its whole lifetime (cmd_serve)
             elif PLAT.is_mac and shutil.which("caffeinate"):
                 self._proc = subprocess.Popen(["caffeinate", "-i", "-w", str(os.getpid())], **popen_kwargs(False))
-            elif PLAT.is_termux and shutil.which("termux-wake-lock"):
-                subprocess.Popen(["termux-wake-lock"], **popen_kwargs(False))
             elif shutil.which("systemd-inhibit"):
                 self._proc = subprocess.Popen(
                     ["systemd-inhibit", "--what=sleep", "--who=LocalFlix", "--why=Streaming media",
@@ -540,9 +554,9 @@ class SleepInhibitor:
 
     def _stop(self) -> None:
         try:
-            if PLAT.is_windows:
-                import ctypes
-                ctypes.windll.kernel32.SetThreadExecutionState(0x80000000)  # type: ignore[attr-defined]
+            if self._win_stop is not None:
+                self._win_stop.set()
+                self._win_stop = None
             if self._proc:
                 kill_tree(self._proc)
                 self._proc = None
@@ -744,6 +758,8 @@ def validate_setting(key: str, value: Any) -> Any:
             v = int(value) if t == "int" else float(value)
         except (TypeError, ValueError):
             raise ValueError(f"{key} must be a number") from None
+        if not math.isfinite(v):
+            raise ValueError(f"{key} must be a finite number")
         if "min" in spec and v < spec["min"]:
             raise ValueError(f"{key} must be ≥ {spec['min']}")
         if "max" in spec and v > spec["max"]:
@@ -870,6 +886,10 @@ class Database:
                 raise sqlite3.DatabaseError(r[0])
             self.migrate()
         except sqlite3.DatabaseError as e:
+            msg = str(e).lower()
+            if isinstance(e, sqlite3.OperationalError) and not any(
+                    k in msg for k in ("malformed", "not a database", "corrupt")):
+                raise  # locked / unable to open: not corruption — never rename the user's DB
             log.error("Database corrupted (%s) — rebuilding index", e)
             self.close_all()
             stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -894,6 +914,17 @@ class Database:
             with self._all_lock:
                 self._all.append(c_)
         return c_
+
+    def release_thread(self) -> None:
+        """Close the calling thread's connection (short-lived HTTP worker threads)."""
+        c_ = getattr(self.local, "conn", None)
+        if c_ is None:
+            return
+        self.local.conn = None
+        with self._all_lock, contextlib.suppress(ValueError):
+            self._all.remove(c_)
+        with contextlib.suppress(Exception):
+            c_.close()
 
     def close_all(self) -> None:
         with self._all_lock:
@@ -1314,15 +1345,20 @@ def parse_name(rel_path: str, library_type: str = "mixed") -> dict[str, Any]:
         if season_dir is not None and ep_match.re in (_EP_ONLY_RE,):
             res["season"] = season_dir
         res["series"] = series
-        et = _clean_title(after)
+        after = _strip_group(after)
+        tm = _TAG_RE.search(after)
+        if tm:
+            after = after[:tm.start()]
+        et = _clean_title(after, cut_tags=False)
         res["episode_title"] = et or None
         res["title"] = et or f"Episode {res['episode']}"
         return res
     # Movie
     work = stem
     ym = None
+    max_year = time.localtime().tm_year + 1
     for m in _YEAR_RE.finditer(work):
-        if m.start() > 0:
+        if m.start() > 0 and int(m.group(1)) <= max_year:
             ym = m  # take the last plausible year that isn't at the start ("2001 A Space Odyssey 1968")
     title = (_clean_title(work[:ym.start()], cut_tags=False) or _clean_title(work[:ym.start()])) if ym else \
         _clean_title(_strip_group(work))
@@ -1507,9 +1543,14 @@ def keyframe_table(ff: FFmpeg, path: Path, cache: Path, timeout: float = 600) ->
     kfs = sorted(set(kfs))
     if not kfs:
         return None
-    tmp = cache.with_suffix(".tmp")
-    tmp.write_text(json.dumps(kfs))
-    os.replace(tmp, cache)
+    tmp = cache.with_name(f"{cache.stem}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        tmp.write_text(json.dumps(kfs))
+        os.replace(tmp, cache)
+    except OSError as e:
+        log.debug("keyframe cache write failed: %s", e)
+        with contextlib.suppress(OSError):
+            tmp.unlink()
     return kfs
 
 
@@ -1657,8 +1698,16 @@ def ass_to_vtt(text: str) -> str:
 
 def microdvd_to_vtt(text: str, fps: float = 23.976) -> str:
     out = ["WEBVTT", ""]
+    first = True
     for line in text.replace("\r", "").split("\n"):
         m = re.match(r"\{(\d+)\}\{(\d+)\}(.*)", line.strip())
+        if m and first:
+            first = False
+            with contextlib.suppress(ValueError):  # "{1}{1}25.000" header declares the frame rate
+                hdr = float(m.group(3).strip())
+                if int(m.group(1)) <= 1 and 10 <= hdr <= 120:
+                    fps = hdr
+                    continue
         if m:
             a, b = int(m.group(1)) / fps, int(m.group(2)) / fps
             body = re.sub(r"\{[^}]*\}", "", m.group(3)).replace("|", "\n")
@@ -1682,8 +1731,18 @@ def _ttml_text(node: Any, parts: list[str]) -> None:
 def ttml_to_vtt(text: str) -> str:
     import xml.etree.ElementTree as ET
 
+    tick_rate = frame_rate = 0.0
+
     def tt(v: str) -> float:
         v = v.strip()
+        if v.endswith("t"):
+            return float(v[:-1]) / (tick_rate or 10_000_000)
+        if v.endswith("f"):
+            return float(v[:-1]) / (frame_rate or 25)
+        if v.endswith("h"):
+            return float(v[:-1]) * 3600
+        if v.endswith("m") and not v.endswith("ms"):
+            return float(v[:-1]) * 60
         if v.endswith("ms"):
             return float(v[:-2]) / 1000
         if v.endswith("s"):
@@ -1691,6 +1750,8 @@ def ttml_to_vtt(text: str) -> str:
         parts = v.split(":")
         if len(parts) == 3:
             return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2].replace(",", "."))
+        if len(parts) == 4:  # HH:MM:SS:FF
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2]) + int(parts[3]) / (frame_rate or 25)
         return float(v)
 
     out = ["WEBVTT", ""]
@@ -1698,6 +1759,12 @@ def ttml_to_vtt(text: str) -> str:
         root = ET.fromstring(text.encode("utf-8"))
     except ET.ParseError:
         return "WEBVTT\n\n"
+    for k, v in root.attrib.items():
+        with contextlib.suppress(ValueError):
+            if k.endswith("tickRate"):
+                tick_rate = float(v)
+            elif k.endswith("frameRate"):
+                frame_rate = float(v)
     for el in root.iter():
         if el.tag.endswith("}p") or el.tag == "p":
             b, e = el.get("begin"), el.get("end")
@@ -1728,12 +1795,25 @@ def find_external_subs(media: Path) -> list[dict[str, Any]]:
     stem = media.stem.lower()
     found: list[dict[str, Any]] = []
     dirs = [media.parent]
-    for d in ("Subs", "Subtitles", "subs", "subtitles", "Sub", "subs"):
-        p = media.parent / d
-        if p.is_dir() and p not in dirs:
-            dirs.append(p)
-            if (p / media.stem).is_dir():
-                dirs.append(p / media.stem)
+    own_dirs: set[str] = set()  # Subs/<media stem>/ — every file there belongs to this media
+    seen_dirs: set[str] = {os.path.normcase(str(media.parent.resolve()))}
+    try:
+        children = {e.name.lower(): e.path for e in os.scandir(media.parent) if e.is_dir()}
+    except OSError:
+        children = {}
+    for d in ("subs", "subtitles", "sub"):
+        if d not in children:
+            continue
+        p = Path(children[d])
+        key = os.path.normcase(str(p.resolve()))
+        if key in seen_dirs:
+            continue
+        seen_dirs.add(key)
+        dirs.append(p)
+        if (p / media.stem).is_dir():
+            dirs.append(p / media.stem)
+            own_dirs.add(str(p / media.stem))
+    seen_files: set[str] = set()
     for d in dirs:
         try:
             entries = list(os.scandir(d))
@@ -1746,9 +1826,13 @@ def find_external_subs(media: Path) -> list[dict[str, Any]]:
             if p.suffix.lower() not in SUB_EXTS:
                 continue
             ps = p.stem.lower()
-            in_sub_dir = d != media.parent
-            if not (ps == stem or ps.startswith((stem + ".", stem + "_")) or in_sub_dir):
+            in_own_dir = str(d) in own_dirs
+            if not (ps == stem or ps.startswith((stem + ".", stem + "_")) or in_own_dir):
                 continue
+            fkey = os.path.normcase(str(p.resolve()))
+            if fkey in seen_files:
+                continue
+            seen_files.add(fkey)
             rest = ps[len(stem):].strip("._ -") if ps.startswith(stem) else ps
             tokens = [t for t in re.split(r"[._ \-]", rest) if t]
             lang = ""
@@ -1820,6 +1904,8 @@ class Scanner:
         self._qlock = threading.Lock()
         self._threads: list[threading.Thread] = []
         self._kf_running: set[str] = set()
+        self._kf_q: queue.Queue[tuple[str, Path, Path]] = queue.Queue()
+        self._kf_thread: threading.Thread | None = None
 
     def start(self) -> None:
         t = threading.Thread(target=self._loop, name="scanner", daemon=True)
@@ -1879,9 +1965,21 @@ class Scanner:
     def _walk(self, root: Path) -> Iterator[tuple[str, int, int]]:
         include_hidden = bool(self.app.setting("include_hidden"))
         patterns = [p.lower() for p in (self.app.setting("ignore_patterns") or [])]
+        try:
+            root_real = root.resolve()
+        except OSError:
+            root_real = root
+        visited: set[tuple[int, int]] = set()
         stack = [root]
         while stack:
             d = stack.pop()
+            try:
+                dst = os.stat(long_path(d))
+                if (dst.st_dev, dst.st_ino) in visited and dst.st_ino:
+                    continue  # symlink loop / already walked
+                visited.add((dst.st_dev, dst.st_ino))
+            except OSError:
+                continue
             try:
                 it = os.scandir(long_path(d))
             except PermissionError as e:
@@ -1905,6 +2003,11 @@ class Scanner:
                         if PLAT.is_windows and not include_hidden:
                             attrs = getattr(e.stat(follow_symlinks=False), "st_file_attributes", 0)
                             if attrs & 0x6:
+                                continue
+                        if e.is_symlink():
+                            # links must stay inside the library (same rule as safe_join for serving)
+                            real = Path(e.path).resolve()
+                            if real != root_real and not real.is_relative_to(root_real):
                                 continue
                         if e.is_dir(follow_symlinks=True):
                             stack.append(Path(e.path))
@@ -1992,17 +2095,24 @@ class Scanner:
                      info["season"], info["episode"], info["episode_end"], info["episode_title"], folder,
                      min(now, mtime_ns / 1e9) if full else now)))
             else:
+                file_changed = int(ex["size"] != size or ex["mtime_ns"] != mtime_ns)
                 batch.append((
-                    ("UPDATE items SET size=?,mtime_ns=?,kind=?,title=COALESCE(CASE WHEN tmdb_id IS NULL THEN ? END,title),"
-                     "sort_title=?,year=COALESCE(year,?),series_id=?,season=?,episode=?,episode_end=?,episode_title=?,"
-                     "folder=?,probed_at=NULL,missing_at=NULL,unplayable=NULL WHERE id=?"),
+                    ("UPDATE items SET size=?,mtime_ns=?,kind=?,"
+                     "title=COALESCE(CASE WHEN tmdb_id IS NULL THEN ? END,title),"
+                     "sort_title=COALESCE(CASE WHEN tmdb_id IS NULL THEN ? END,sort_title),year=COALESCE(year,?),"
+                     "series_id=?,season=?,episode=?,episode_end=?,episode_title=?,folder=?,missing_at=NULL,"
+                     "probed_at=CASE WHEN ? THEN NULL ELSE probed_at END,"
+                     "unplayable=CASE WHEN ? THEN NULL ELSE unplayable END WHERE id=?"),
                     (size, mtime_ns, kind, title, sort_title(title), info["year"], series_id, info["season"],
-                     info["episode"], info["episode_end"], info["episode_title"], folder, iid)))
+                     info["episode"], info["episode_end"], info["episode_title"], folder, file_changed, file_changed,
+                     iid)))
             if self.db.fts:
                 batch.append(("DELETE FROM fts_items WHERE id=?", (iid,)))
-                batch.append(("INSERT INTO fts_items(id,title,series,genres,overview) VALUES(?,?,?,?,?)",
-                              (iid, title, info["series"] or "", "", "")))
-            to_probe.append(iid)
+                batch.append((("INSERT INTO fts_items(id,title,series,genres,overview) SELECT id, title, ?, "
+                               "COALESCE(genres_json,''), COALESCE(overview,'') FROM items WHERE id=?"),
+                              (info["series"] or "", iid)))
+            if ex is None or ex["size"] != size or ex["mtime_ns"] != mtime_ns or ex["probed_at"] is None:
+                to_probe.append(iid)
             changed = True
             if len(batch) >= 1000:
                 flush()
@@ -2025,6 +2135,11 @@ class Scanner:
                     if self.db.fts:
                         conn.execute("DELETE FROM fts_items WHERE id=?", (iid,))
                     conn.execute("DELETE FROM artwork WHERE item_id=?", (iid,))
+            for iid in gone:  # generated files (watch state is kept: ids are stable if the file comes back)
+                shutil.rmtree(self.app.paths.trickplay / iid, ignore_errors=True)
+                for f in self.app.paths.images.glob(f"{iid}_*"):
+                    with contextlib.suppress(OSError):
+                        f.unlink()
         for iid in to_probe:
             self.enqueue_probe(iid)
         return changed
@@ -2124,20 +2239,40 @@ class Scanner:
                 self.warm_keyframes(iid, path)
 
     def warm_keyframes(self, iid: str, path: Path) -> None:
-        if iid in self._kf_running:
+        """Queue a background keyframe-table build (one low-priority ffprobe at a time)."""
+        try:
+            st = path.stat()
+        except OSError:
             return
-        sig = stable_id(iid, path.stat().st_size, path.stat().st_mtime_ns)
-        cache = self.app.paths.keyframes / f"{sig}.json"
+        cache = self.app.paths.keyframes / f"{stable_id(iid, st.st_size, st.st_mtime_ns)}.json"
         if cache.exists():
             return
-        self._kf_running.add(iid)
+        with self._qlock:
+            if iid in self._kf_running:
+                return
+            self._kf_running.add(iid)
+            if self._kf_thread is None:
+                self._kf_thread = threading.Thread(target=self._kf_loop, name="keyframes", daemon=True)
+                self._kf_thread.start()
+        self._kf_q.put((iid, path, cache))
 
-        def run() -> None:
+    def _kf_loop(self) -> None:
+        while not self._stop.is_set():
             try:
-                keyframe_table(self.app.ff, path, cache)
+                iid, path, cache = self._kf_q.get(timeout=5)
+            except queue.Empty:
+                continue
+            while (self.app.setting("pause_bg_while_streaming") and self.app.hls.active_streams() > 0
+                   and not self._stop.is_set()):
+                time.sleep(2)
+            try:
+                if not cache.exists():
+                    keyframe_table(self.app.ff, path, cache)
+            except Exception as e:  # noqa: BLE001
+                log.debug("keyframe warmup %s failed: %s", iid, e)
             finally:
-                self._kf_running.discard(iid)
-        threading.Thread(target=run, name="keyframes", daemon=True).start()
+                with self._qlock:
+                    self._kf_running.discard(iid)
 
 
 # ===== SECTION: artwork =====
@@ -2150,6 +2285,7 @@ class ArtworkWorker:
         self.app = app
         self.db = app.db
         self.q: queue.PriorityQueue[tuple[int, float, str, str]] = queue.PriorityQueue()
+        self.tq: queue.PriorityQueue[tuple[int, float, str, str]] = queue.PriorityQueue()  # trickplay (slow)
         self._queued: set[tuple[str, str]] = set()
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -2157,28 +2293,31 @@ class ArtworkWorker:
         self.trick_status: dict[str, str] = {}
 
     def start(self) -> None:
-        threading.Thread(target=self._loop, name="artwork", daemon=True).start()
+        threading.Thread(target=self._loop, args=(self.q,), name="artwork", daemon=True).start()
+        threading.Thread(target=self._loop, args=(self.tq,), name="trickplay", daemon=True).start()
 
     def stop(self) -> None:
         self._stop.set()
         self.q.put((99, 0, "", ""))
+        self.tq.put((99, 0, "", ""))
 
     def enqueue(self, iid: str, prio: int = 6, job: str = "art") -> None:
         with self._lock:
             if (iid, job) in self._queued:
                 return
             self._queued.add((iid, job))
-        self.q.put((prio, time.time(), iid, job))
+        (self.tq if job == "trick" else self.q).put((prio, time.time(), iid, job))
 
-    def _loop(self) -> None:
+    def _loop(self, q: queue.PriorityQueue[tuple[int, float, str, str]]) -> None:
         while not self._stop.is_set():
-            prio, _, iid, job = self.q.get()
+            prio, ts, iid, job = q.get()
             if not iid:
                 break
-            # pause background work while streams are active (setting)
-            while (prio > 2 and self.app.setting("pause_bg_while_streaming") and self.app.hls.active_streams() > 0
-                   and not self._stop.is_set()):
-                time.sleep(2)
+            # pause low-priority background work while streams are active (setting); urgent jobs still run
+            if prio > 3 and self.app.setting("pause_bg_while_streaming") and self.app.hls.active_streams() > 0:
+                q.put((prio, ts, iid, job))
+                self._stop.wait(2)
+                continue
             with self._lock:
                 self._queued.discard((iid, job))
             try:
@@ -2335,14 +2474,18 @@ class ArtworkWorker:
         with self.resize_sem:
             if out.exists():
                 return out
-            tmp = out.with_name(out.stem + ".tmp" + ext)
+            tmp = out.with_name(f"{out.stem}.{threading.get_ident()}.tmp{ext}")
             args = [self.app.ff.ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(src),
                     "-vf", f"scale='min({w},iw)':-2", "-frames:v", "1"]
             args += ["-c:v", "libwebp", "-quality", "80"] if ext == ".webp" else ["-q:v", "3"]
             rc, _, _ = run_capture(args + [str(tmp)], timeout=20)
             if rc == 0 and tmp.exists():
-                os.replace(tmp, out)
-                return out
+                try:
+                    os.replace(tmp, out)
+                except OSError:
+                    with contextlib.suppress(OSError):
+                        tmp.unlink()
+                return out if out.exists() else src
         return src
 
     # --- trickplay ----------------------------------------------------------
@@ -2400,6 +2543,7 @@ class Tmdb:
         self.q: queue.Queue[str] = queue.Queue()
         self._last = 0.0
         self._started = False
+        self._start_lock = threading.Lock()
 
     @property
     def key(self) -> str:
@@ -2410,9 +2554,10 @@ class Tmdb:
         return bool(self.key)
 
     def enqueue(self, iid: str) -> None:
-        if not self._started:
-            self._started = True
-            threading.Thread(target=self._loop, name="tmdb", daemon=True).start()
+        with self._start_lock:
+            if not self._started:
+                self._started = True
+                threading.Thread(target=self._loop, name="tmdb", daemon=True).start()
         self.q.put(iid)
 
     def _get(self, path: str, params: dict[str, Any]) -> dict[str, Any] | None:
@@ -2660,14 +2805,15 @@ class Library:
             order = "ASC"
         if typ == "series":
             q = (params.get("q") or "").strip()
-            where, args = "1=1", []
+            bw, bargs = self.base_where(profile)
+            where, args = f"id IN (SELECT i.series_id FROM items i WHERE {bw})", list(bargs)
             if q:
                 where += " AND title LIKE ?"
                 args.append(f"%{q}%")
             latest = "(SELECT MAX(added_at) FROM items WHERE series_id=series.id)"
             col = {"title": "sort_title", "year": "year", "rating": "rating"}.get(sort, latest)
-            rows = self.db.q(f"SELECT * FROM series WHERE {where} AND id IN (SELECT series_id FROM items WHERE missing_at "
-                             f"IS NULL) ORDER BY {col} {order} LIMIT ? OFFSET ?", args + [limit + 1, offset])
+            rows = self.db.q(f"SELECT * FROM series WHERE {where} ORDER BY {col} {order} LIMIT ? OFFSET ?",
+                             args + [limit + 1, offset])
             more = len(rows) > limit
             return {"items": [self.series_card(s, pid) for s in rows[:limit]],
                     "next": str(offset + limit) if more else None}
@@ -2754,8 +2900,8 @@ class Library:
             items = self.cards(rows, pid)
         like = f"%{q.strip()}%"
         series = [self.series_card(s, pid) for s in self.db.q(
-            "SELECT * FROM series WHERE title LIKE ? AND id IN (SELECT series_id FROM items WHERE missing_at IS NULL) "
-            "LIMIT 20", (like,))]
+            f"SELECT * FROM series WHERE title LIKE ? AND id IN (SELECT i.series_id FROM items i WHERE {where}) "
+            "LIMIT 20", [like, *args])]
         # collapse episodes of matched series
         sids = {s["id"] for s in series}
         items = [x for x in items if not (x["kind"] == "episode" and x["seriesId"] in sids)]
@@ -2767,7 +2913,8 @@ class Library:
         return self.db.one(f"SELECT {self.ITEM_COLS} FROM items i LEFT JOIN series s ON s.id=i.series_id "
                            "WHERE i.series_id=? AND i.missing_at IS NULL AND (i.season>? OR (i.season=? AND i.episode>?)) "
                            "ORDER BY i.season, i.episode LIMIT 1",
-                           (row["series_id"], row["season"] or 0, row["season"] or 0, row["episode"] or 0))
+                           (row["series_id"], row["season"] or 0, row["season"] or 0,
+                            row["episode_end"] or row["episode"] or 0))
 
     def prev_episode(self, row: sqlite3.Row) -> sqlite3.Row | None:
         if not row["series_id"]:
@@ -2807,7 +2954,8 @@ class Library:
     def details(self, profile: sqlite3.Row, iid: str) -> dict[str, Any] | None:
         pid = profile["id"]
         row = self.db.one(f"SELECT {self.ITEM_COLS}, i.container, i.bitrate, i.v_profile, i.v_bitdepth, i.v_fps, "
-                          f"i.cast_json, i.size FROM items i LEFT JOIN series s ON s.id=i.series_id WHERE i.id=?", (iid,))
+                          f"i.cast_json, i.size FROM items i LEFT JOIN series s ON s.id=i.series_id "
+                          f"WHERE i.id=? AND {self.base_where(profile)[0]}", [iid, *self.base_where(profile)[1]])
         if row is None:
             return None
         d = self.cards([row], pid)[0]
@@ -2844,9 +2992,12 @@ class Library:
                          f"i.series_id=? ORDER BY i.season, i.episode, i.sort_title", args + [sid])
         eps = self.cards(rows, pid)
         seasons = sorted({e["season"] if e["season"] is not None else 1 for e in eps})
-        d["seasons"] = [{"number": n, "episodeCount": sum(1 for e in eps if (e["season"] or 1) == n)} for n in seasons]
+
+        def sn(e: dict[str, Any]) -> int:
+            return 1 if e["season"] is None else e["season"]
+        d["seasons"] = [{"number": n, "episodeCount": sum(1 for e in eps if sn(e) == n)} for n in seasons]
         if season is not None:
-            eps = [e for e in eps if (e["season"] or 1) == season]
+            eps = [e for e in eps if sn(e) == season]
         d["episodes"] = eps
         # next up: first unwatched after the most recently played episode
         ws_rows = [e for e in eps if e.get("lastPlayed")]
@@ -3046,7 +3197,7 @@ def decide_playback(item: dict[str, Any], caps: dict[str, Any], opts: dict[str, 
         elif codec == "h264" and not _h264_ok(v.get("profile") or "", v.get("bitdepth") or 8):
             video_ok = False
             reasons.append("h264_profile_unsupported")
-        elif codec == "hevc" and (v.get("bitdepth") or 8) > 8 and "hevc10" not in cv and "hevc" not in cv:
+        elif codec == "hevc" and (v.get("bitdepth") or 8) > 8 and "hevc10" not in cv:
             video_ok = False
             reasons.append("hevc10_unsupported")
         if v.get("hdr") and not hdr_caps and opts.get("tonemap", True):
@@ -3172,11 +3323,10 @@ def build_keyframe_segments(kfs: list[float], duration: float, target: float = S
 
     Returns the segment table and, per segment, the half-open GOP index range it covers.
     """
-    kfs = sorted(k for k in kfs if k >= 0)
-    if not kfs or kfs[0] > 0.5:
-        kfs = [0.0] + kfs
+    # keyframe 0 is moved to t=0 (never inserted): ffmpeg's first GOP file always starts at the first real keyframe
+    kfs = sorted(k for k in kfs if k >= 0) or [0.0]
     kfs[0] = 0.0
-    bounds = kfs + [duration]
+    bounds = kfs + [max(duration, kfs[-1] + 0.1)]
     segs: list[tuple[float, float]] = []
     groups: list[tuple[int, int]] = []
     a = 0
@@ -3239,6 +3389,10 @@ def _suspend(proc: subprocess.Popen, suspend: bool) -> bool:
         return True
     except Exception:  # noqa: BLE001
         return False
+
+
+class TranscodeBusy(Exception):
+    """Raised when the concurrent-transcode cap is reached and no job can be evicted."""
 
 
 class TranscodeJob:
@@ -3317,10 +3471,11 @@ class TranscodeJob:
     def kill(self) -> None:
         self.killed = True
         if self.proc is not None:
-            if self.paused:
-                _suspend(self.proc, False)
-            kill_tree(self.proc)
+            kill_tree(self.proc, hard=True)
             CHILDREN.remove(self.proc)
+        for p in list(self.outdir.glob("*.tmp")) if self.outdir.exists() else []:
+            with contextlib.suppress(OSError):
+                p.unlink()
 
     def set_paused(self, paused: bool) -> None:
         if self.proc is None or paused == self.paused or not self.alive():
@@ -3375,10 +3530,10 @@ class HlsSession:
         if self.video_mode == "copy":
             assert kfs is not None
             st = float(self.info.get("start_time") or 0)
-            rel = [round(k - st, 6) for k in kfs]
+            rel = sorted({round(max(0.0, k - st), 6) for k in kfs if k - st >= -0.05}) or [0.0]
+            rel[0] = 0.0
             self.vsegs, self.groups = build_keyframe_segments(rel, self.duration)
-            self.gops = [0.0] + [k for k in rel if k > 0.0005] if rel and rel[0] > 0.5 else [max(0.0, r) for r in rel]
-            self.gops[0] = 0.0
+            self.gops = rel
             gaps = [b - a for a, b in zip(self.gops, self.gops[1:]) if b - a > 0.0005]
             self.gop_time = max(0.005, min(0.5, (min(gaps) if gaps else 1.0) * 0.5))
         elif self.video_mode == "transcode":
@@ -3571,7 +3726,8 @@ class HlsSession:
                 args += ["-c:a", "aac", "-b:a", "192k", "-ac", "2"]
             else:
                 args += ["-c:a", "aac", "-b:a", "384k", "-ac", str(min(ch, 6))]
-            args += ["-af", "aresample=async=1:first_pts=0"]
+            # first_pts=0 only after a seek: from the start, keep the track's own offset (A/V sync)
+            args += ["-af", "aresample=async=1:first_pts=0" if t > 0 else "aresample=async=1"]
         if a.get("lang"):
             args += ["-metadata:s:a:0", f"language={a['lang']}"]
         args += ["-avoid_negative_ts", "make_non_negative", "-output_ts_offset", f"{t:.6f}"]
@@ -3630,7 +3786,11 @@ class HlsSession:
     def ensure_simple(self) -> TranscodeJob:
         with self.lock:
             job = self.jobs.get("simple")
+            if job is not None and job.killed:
+                raise FileNotFoundError("simple-mode job was stopped")  # client renegotiates at its position
             if job is None or (job.finished and job.returncode not in (0,) and not self.sw_fallback and job.head < 0):
+                if self.video_mode == "transcode":
+                    self.manager.make_room(self)
                 if job is not None and self.video_mode == "transcode" and self.hw and not self.sw_fallback:
                     self.sw_fallback = True
                     log.warning("HW encode failed (%s) — retrying with software", self.hw)
@@ -3638,6 +3798,7 @@ class HlsSession:
                 ext = "m4s" if self.fmp4 else "ts"
                 job = TranscodeJob(self, "simple", 0, self.simple_args(), outdir,
                                    lambda n: outdir / f"s_{n:05d}.{ext}", None if self.sw_fallback else self.hw)
+                job.is_transcode = self.video_mode == "transcode"  # type: ignore[attr-defined]
                 self.manager.register_job(job)
                 job.start()
                 self.jobs["simple"] = job
@@ -3693,14 +3854,18 @@ class HlsSession:
                 with self.lock:
                     job = self.jobs.get(rendition)
                     if job is not None:
-                        job.requested = max(job.requested if job.requested <= b + lookahead * 3 else 0, b)
+                        job.requested = b  # playhead proxy for throttling
                         job.last_request = time.time()
+                        if job.paused and job.head - b <= lookahead:
+                            job.set_paused(False)
                 return files
+            if self.manager.get(self.id) is not self:
+                return None  # session was stopped/replaced while we waited
             ahead = lookahead * 3 if rendition == "video" and self.video_mode == "copy" else lookahead
             with self.lock:
                 job = self.jobs.get(rendition)
                 missing = next(u for u, f in zip(range(a, b), files) if not f.exists())
-                restart = job is None or missing < job.start_seg or \
+                restart = job is None or missing < job.start_seg or missing <= job.head or \
                     (job.finished and job.head < missing) or \
                     missing > max(job.head, job.start_seg) + max(2, ahead)
                 if job is not None and job.finished and job.returncode not in (0, None) and job.head < missing:
@@ -3708,6 +3873,9 @@ class HlsSession:
                         self.sw_fallback = True
                         log.warning("HW encoder %s failed (%s) — falling back to software", self.hw,
                                     " ".join(job.stderr)[-200:])
+                        # drop everything the HW encoder wrote so init + segments come from one encoder
+                        shutil.rmtree(self.dir / "video", ignore_errors=True)
+                        restart = True
                     elif retried:
                         self.error = " ".join(job.stderr)[-300:] or "ffmpeg failed"
                         return None
@@ -3725,10 +3893,16 @@ class HlsSession:
     def init_file(self, rendition: str) -> Path | None:
         d = self.dir / ("video" if rendition == "video" else rendition)
         for _ in range(400):
-            cands = sorted(d.glob("init_*.mp4"), key=lambda p: p.stat().st_mtime) if d.exists() else []
-            cands = [p for p in cands if p.stat().st_size > 0]
+            cands: list[tuple[float, Path]] = []
+            for p in (d.glob("init_*.mp4") if d.exists() else []):
+                with contextlib.suppress(OSError):
+                    st = p.stat()
+                    if st.st_size > 0:
+                        cands.append((st.st_mtime, p))
             if cands:
-                return cands[0]
+                return min(cands)[1]
+            if self.manager.get(self.id) is not self:
+                return None
             # kick a job so the init segment gets written
             with self.lock:
                 if rendition not in self.jobs:
@@ -3765,9 +3939,10 @@ class HlsManager:
     def stop(self) -> None:
         self._stop.set()
         with self.lock:
-            for s in list(self.sessions.values()):
-                s.stop()
+            sessions = list(self.sessions.values())
             self.sessions.clear()
+        for s in sessions:  # outside the manager lock (lock order is always session → manager)
+            s.stop()
 
     def max_transcodes(self) -> int:
         n = int(self.app.setting("max_transcodes") or 0)
@@ -3783,15 +3958,24 @@ class HlsManager:
                 self.jobs.remove(job)
 
     def make_room(self, session: HlsSession) -> None:
+        """Enforce the transcode cap: evict only idle jobs (> 15 s without requests), else refuse."""
+        victims: list[TranscodeJob] = []
         with self.lock:
             tj = [j for j in self.jobs if getattr(j, "is_transcode", False) and j.alive() and j.session is not session]
+            now = time.time()
             while len(tj) >= self.max_transcodes():
-                victim = min(tj, key=lambda j: j.last_request)
-                log.info("Transcode cap reached — stopping job of session %s", victim.session.id)
-                victim.kill()
-                self.unregister_job(victim)
-                victim.session.jobs.pop(victim.rendition, None)
+                idle = [j for j in tj if now - j.last_request > 15]
+                if not idle:
+                    raise TranscodeBusy("Transcode limit reached — another stream is being converted")
+                victim = min(idle, key=lambda j: j.last_request)
+                log.info("Transcode cap reached — stopping idle job of session %s", victim.session.id)
+                victims.append(victim)
+                self.jobs.remove(victim)
                 tj.remove(victim)
+        for v in victims:
+            v.kill()
+            if v.session.jobs.get(v.rendition) is v:
+                v.session.jobs.pop(v.rendition, None)
 
     def create(self, item_id: str, path: Path, info: dict[str, Any], decision: dict[str, Any],
                start_time: float = 0.0, replace: str | None = None) -> HlsSession:
@@ -3867,10 +4051,11 @@ class HlsManager:
                     j.update_head()
                     if not j.alive():
                         continue
-                    if now - j.last_request > 60:  # idle timeout
+                    if now - j.last_request > (300 if j.rendition == "simple" else 60):  # idle timeout
                         j.kill()
                         self.unregister_job(j)
-                        j.session.jobs.pop(j.rendition, None)
+                        if j.session.jobs.get(j.rendition) is j:
+                            j.session.jobs.pop(j.rendition, None)
                         continue
                     ahead = lookahead * (3 if j.rendition == "video" and j.session.video_mode == "copy" else 1)
                     if j.head - j.requested > ahead:
@@ -3907,10 +4092,13 @@ class HlsManager:
             return
         files.sort()
         active_dirs = {str(s.dir) for s in self.sessions.values() if time.time() - s.last_access < 120}
-        for _, size, p in files:
+        now = time.time()
+        for ts, size, p in files:
             if total <= limit * 0.9:
                 break
-            if any(str(p).startswith(d) for d in active_dirs) and not p.name.startswith(("seg_", "gop_")):
+            # active session: keep init/playlist files and anything touched in the last 5 minutes
+            if any(str(p).startswith(d) for d in active_dirs) and (
+                    not p.name.startswith(("seg_", "gop_")) or now - ts < 300):
                 continue
             with contextlib.suppress(OSError):
                 p.unlink()
@@ -4271,10 +4459,8 @@ class Auth:
         return verify_secret(pw, self.db.kv_get("auth_hash"))
 
     def check_admin_pin(self, pin: str) -> bool:
-        h = self.db.kv_get("admin_pin_hash")
-        if h:
-            return verify_secret(pin, h)
-        return self.check_password(pin)
+        """Admin elevation needs the separate admin PIN (PRD §7); without one only loopback is admin."""
+        return verify_secret(pin, self.db.kv_get("admin_pin_hash"))
 
     def make_one_time(self) -> str:
         tok = secrets.token_urlsafe(18)
@@ -4322,6 +4508,31 @@ def parse_range(header: str | None, size: int) -> tuple[int, int] | None:
     return start, min(end, size - 1)
 
 
+def host_allowed(host_hdr: str | None, app: App) -> bool:
+    """DNS-rebinding guard: accept IP literals, localhost names, this machine's names and the mDNS name."""
+    if not host_hdr:
+        return True  # HTTP/1.0 clients
+    h = host_hdr.strip().lower()
+    if h.startswith("["):
+        h = h[1:h.find("]")] if "]" in h else h[1:]
+    elif h.count(":") == 1:
+        h = h.rsplit(":", 1)[0]
+    h = h.rstrip(".")
+    try:
+        ipaddress.ip_address(h.split("%")[0])
+        return True
+    except ValueError:
+        pass
+    if h == "localhost" or h.endswith(".localhost"):
+        return True
+    names = {socket.gethostname().lower(), socket.gethostname().lower().split(".")[0]}
+    with contextlib.suppress(OSError):
+        names.add(socket.getfqdn().lower())
+    mdns = str(app.setting("mdns_name") or "localflix").lower()
+    names |= {f"{n}.local" for n in list(names)} | {f"{mdns}.local", mdns}
+    return h in names
+
+
 class HTTPError(Exception):
     def __init__(self, status: int, code: str, message: str = "", headers: dict[str, str] | None = None) -> None:
         super().__init__(message or code)
@@ -4347,19 +4558,35 @@ class Server(http.server.ThreadingHTTPServer):
     def __init__(self, addr: tuple[str, int], handler: type, app: App) -> None:
         self.app = app
         self.conn_sem = threading.BoundedSemaphore(int(app.setting("max_connections") or 64))
+        if ":" in addr[0]:
+            self.address_family = socket.AF_INET6
         super().__init__(addr, handler)
 
     def process_request(self, request: Any, client_address: Any) -> None:
-        if not self.conn_sem.acquire(timeout=5):
+        # never block the accept loop: when every slot is busy, answer 503 and close
+        if not self.conn_sem.acquire(blocking=False):
             with contextlib.suppress(OSError):
+                if not isinstance(request, ssl.SSLSocket):
+                    request.settimeout(1)
+                    request.sendall(b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 2\r\nContent-Length: 0\r\n"
+                                    b"Connection: close\r\n\r\n")
                 request.close()
             return
         super().process_request(request, client_address)
 
     def process_request_thread(self, request: Any, client_address: Any) -> None:
         try:
+            if isinstance(request, ssl.SSLSocket):  # TLS handshake off the accept loop
+                request.settimeout(30)
+                try:
+                    request.do_handshake()
+                except (OSError, ssl.SSLError):
+                    with contextlib.suppress(OSError):
+                        request.close()
+                    return
             super().process_request_thread(request, client_address)
         finally:
+            self.app.db.release_thread()
             self.conn_sem.release()
 
     def handle_error(self, request: Any, client_address: Any) -> None:
@@ -4420,8 +4647,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self._session_token: str | None = None
         self._session: sqlite3.Row | None = None
         self._raw_body = b""
+        self._path = ""
+        self._headers_sent = False
         try:
-            n = int(self.headers.get("Content-Length") or 0)
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                if n < 0:
+                    raise ValueError
+            except ValueError:
+                self.close_connection = True
+                raise HTTPError(400, "bad_request", "Invalid Content-Length") from None
             if n > 5_000_000:
                 self.close_connection = True
                 raise HTTPError(413, "too_large", "Request body too large")
@@ -4430,6 +4665,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             parsed = urllib.parse.urlsplit(self.path)
             self.qs = {k: v[-1] for k, v in urllib.parse.parse_qs(parsed.query, keep_blank_values=True).items()}
             path = urllib.parse.unquote(parsed.path)
+            self._path = path
+            if not host_allowed(self.headers.get("Host"), self.app):
+                raise HTTPError(421, "bad_host", "Unknown Host header (DNS rebinding protection)")
             if self.app.setting("private_only") and not is_private_ip(self.ip):
                 raise HTTPError(403, "forbidden", "Only private-network clients are allowed")
             m_method = "GET" if method == "HEAD" else method
@@ -4448,13 +4686,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             raise HTTPError(404, "not_found", f"No route for {path}")
         except HTTPError as e:
-            self.send_json({"error": {"code": e.code, "message": e.message}}, e.status, headers=e.headers)
+            if self._headers_sent:
+                self.close_connection = True
+            else:
+                self.send_json({"error": {"code": e.code, "message": e.message}}, e.status, headers=e.headers)
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError):
             self.close_connection = True
         except Exception as e:  # noqa: BLE001
             log.error("Unhandled error on %s %s: %s\n%s", method, self.path, e, traceback.format_exc())
-            with contextlib.suppress(Exception):
-                self.send_json({"error": {"code": "internal", "message": str(e)[:300]}}, 500)
+            if self._headers_sent:
+                self.close_connection = True  # response already started: don't corrupt the stream
+            else:
+                with contextlib.suppress(Exception):
+                    self.send_json({"error": {"code": "internal", "message": str(e)[:300]}}, 500)
 
     def _cookies(self) -> dict[str, str]:
         import http.cookies
@@ -4476,7 +4720,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             tok = auth.new_session(self.ip)
             sess = auth.lookup(tok)
             self._set_cookie(Auth.COOKIE, tok, int(self.app.setting("session_days") or 30) * 86400)
-        if sess is None and not auth.required:
+        media = self._path.startswith(("/api/v1/hls/", "/api/v1/stream/", "/api/v1/images/", "/api/v1/subtitles/",
+                                       "/api/v1/trickplay/", "/static/", "/vendor/", "/favicon"))
+        if sess is None and not auth.required and not media:  # no session rows for cookieless media fetches
             tok = auth.new_session(self.ip, None, admin=False)
             sess = auth.lookup(tok)
             self._set_cookie(Auth.COOKIE, tok, int(self.app.setting("session_days") or 30) * 86400)
@@ -4494,10 +4740,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             raise HTTPError(415, "unsupported_media_type", "Content-Type must be application/json")
         host = (self.headers.get("Host") or "").lower()
         origin = self.headers.get("Origin") or self.headers.get("Referer")
-        if origin and origin != "null":
-            o = urllib.parse.urlsplit(origin)
-            if o.netloc.lower() != host:
-                raise HTTPError(403, "bad_origin", "Cross-origin request rejected")
+        if origin and (origin == "null" or urllib.parse.urlsplit(origin).netloc.lower() != host):
+            raise HTTPError(403, "bad_origin", "Cross-origin request rejected")
 
     def is_admin(self) -> bool:
         if is_loopback(self.ip):
@@ -4511,23 +4755,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pid = None
         if self._session is not None:
             pid = self._session["profile_id"]
-        hdr = self.headers.get("X-Profile")
-        if pid is None and not self.app.setting("profiles_enabled"):
-            pid = None
         if pid is not None:
             p = db.one("SELECT * FROM profiles WHERE id=?", (pid,))
             if p is not None:
                 return p
-        if hdr and not self.app.setting("profiles_enabled"):
-            with contextlib.suppress(ValueError):
-                p = db.one("SELECT * FROM profiles WHERE id=? AND pin_hash IS NULL", (int(hdr),))
-                if p is not None:
-                    return p
-        p = db.one("SELECT * FROM profiles ORDER BY id LIMIT 1")
-        if p is None:
+        if db.one("SELECT COUNT(*) FROM profiles")[0] == 0:
             db.x("INSERT INTO profiles(name,avatar,kids,created_at) VALUES(?,?,0,?)", ("Me", "a1", time.time()))
-            p = db.one("SELECT * FROM profiles ORDER BY id LIMIT 1")
-        assert p is not None
+        # no profile selected yet: never fall back to a PIN-protected profile
+        p = db.one("SELECT * FROM profiles WHERE pin_hash IS NULL ORDER BY id LIMIT 1")
+        if p is None:
+            raise HTTPError(409, "profile_required", "Select a profile first")
         return p
 
     def body(self, limit: int = 1_000_000) -> Any:
@@ -4537,9 +4774,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not raw:
             return {}
         try:
-            return json.loads(raw.decode("utf-8"))
+            obj = json.loads(raw.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
             raise HTTPError(400, "bad_json", "Invalid JSON") from None
+        if not isinstance(obj, dict):
+            raise HTTPError(400, "bad_json", "JSON object expected")
+        return obj
+
+    def end_headers(self) -> None:
+        self._headers_sent = True
+        super().end_headers()
 
     def _common_headers(self) -> None:
         self.send_header("X-Content-Type-Options", "nosniff")
@@ -4653,13 +4897,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _sendfile(self, fh: Any, offset: int, count: int) -> None:
         self.wfile.flush()
-        try:
-            if isinstance(self.connection, ssl.SSLSocket):
-                raise AttributeError  # noqa: TRY004
-            self.connection.sendfile(fh, offset, count)
-            return
-        except (AttributeError, OSError, ValueError) as e:
-            if isinstance(e, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
+        if not isinstance(self.connection, ssl.SSLSocket):
+            try:
+                self.connection.sendfile(fh, offset, count)  # falls back to send() internally
+                return
+            except (AttributeError, ValueError):
+                pass  # not a regular file/socket: use the copy loop below
+            except OSError:
+                self.close_connection = True  # bytes may already be on the wire: never resend
                 raise
         fh.seek(offset)
         left = count
@@ -4776,6 +5021,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._common_headers()
             self.end_headers()
             self.close_connection = True
+            if self.command == "HEAD":
+                return
             self.connection.settimeout(60)
             self.wfile.write(b"retry: 3000\n\n")
             self.wfile.flush()
@@ -4869,7 +5116,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if b["require"] and not db.kv_get("auth_hash"):
                 raise HTTPError(400, "no_password", "Set a password first")
             db.set_setting("require_password", bool(b["require"]))
-            self.app.invalidate_settings()
+        if "password" in b and self._session_token:  # password changed/removed: sign out every other session
+            db.x("DELETE FROM sessions WHERE token_hash<>?", (hashlib.sha256(self._session_token.encode()).hexdigest(),))
+        self.app.invalidate_settings()
         self.send_json({"ok": True, "required": self.app.auth.required})
 
     @route("POST", r"/api/v1/auth/qr-token", admin=True)
@@ -4885,7 +5134,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     @route("GET", r"/api/v1/profiles")
     def h_profiles(self) -> None:
-        self.profile()  # ensure default exists
+        if self.app.db.one("SELECT COUNT(*) FROM profiles")[0] == 0:
+            self.app.db.x("INSERT INTO profiles(name,avatar,kids,created_at) VALUES(?,?,0,?)", ("Me", "a1", time.time()))
         self.send_json({"profiles": [self._profile_json(p) for p in self.app.db.q("SELECT * FROM profiles ORDER BY id")],
                         "enabled": bool(self.app.setting("profiles_enabled"))})
 
@@ -5118,7 +5368,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.send_bytes(s.master(text).encode(), m3u8)
         if s.mode == "simple":
             outdir = s.dir / "simple"
-            job = s.ensure_simple()
+            try:
+                job = s.ensure_simple()
+            except FileNotFoundError:
+                self.app.hls.stop_session(sid)
+                raise HTTPError(404, "session_gone", "Playback session expired") from None
+            except TranscodeBusy as e:
+                raise HTTPError(503, "transcode_busy", str(e), {"Retry-After": "5"}) from None
             if name == "stream.m3u8":
                 deadline = time.time() + 40
                 while time.time() < deadline:
@@ -5143,6 +5399,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not p.exists():
                 raise HTTPError(503, "not_ready", "Segment not ready", {"Retry-After": "1"})
             job.last_request = time.time()
+            ms = re.match(r"s_(\d{5})\.", name)
+            if ms:  # throttle relative to what the player actually fetches
+                job.requested = int(ms.group(1))
+                if job.paused and job.head - job.requested <= int(self.app.setting("lookahead") or 12):
+                    job.set_paused(False)
             return self.send_file(p, MIME_MAP.get(p.suffix, "video/mp4"), cache="private, max-age=3600")
         if name == "video.m3u8" and s.video_mode:
             return self.send_bytes(s.video_playlist().encode(), m3u8)
@@ -5161,7 +5422,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.send_bytes(pl.encode(), m3u8)
         m = re.fullmatch(r"init_(video|audio_\d+)\.mp4", name)
         if m:
-            p = s.init_file(m.group(1))
+            try:
+                p = s.init_file(m.group(1))
+            except TranscodeBusy as e:
+                raise HTTPError(503, "transcode_busy", str(e), {"Retry-After": "5"}) from None
             if p is None:
                 raise HTTPError(503, "not_ready", "Init segment not ready", {"Retry-After": "1"})
             return self.send_file(p, "video/mp4", cache="private, max-age=3600")
@@ -5171,7 +5435,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             table = s.vsegs if rend == "video" else s.asegs
             if n >= len(table) or (rend != "video" and int(rend.split("_")[1]) >= len(s.audio)):
                 raise HTTPError(404, "not_found", "Segment out of range")
-            files = s.get_segment(rend, n)
+            try:
+                files = s.get_segment(rend, n)
+            except TranscodeBusy as e:
+                raise HTTPError(503, "transcode_busy", str(e), {"Retry-After": "5"}) from None
             if files is None:
                 if s.error:
                     raise HTTPError(500, "ffmpeg_failed", s.error)
@@ -5229,6 +5496,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try:
             pos = max(0.0, float(b.get("position") or 0))
             dur = max(0.0, float(b.get("duration") or 0))
+            if not (math.isfinite(pos) and math.isfinite(dur)) or pos > 1e7 or dur > 1e7:
+                raise ValueError
         except (TypeError, ValueError):
             raise HTTPError(400, "bad_params", "position/duration must be numbers") from None
         state = str(b.get("state") or "")
@@ -5360,13 +5629,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_json({"ok": True})
 
     # --- libraries -----------------------------------------------------------
-    @route("POST", r"/api/v1/library/scan")
+    @route("POST", r"/api/v1/library/scan", admin=True)
     def h_scan(self) -> None:
         b = self.body()
         self.app.scanner.trigger(bool(b.get("full")))
         self.send_json({"ok": True, "status": self.app.scanner.status})
 
-    @route("GET", r"/api/v1/libraries")
+    @route("GET", r"/api/v1/libraries", admin=True)
     def h_libs(self) -> None:
         out = []
         for r in self.app.db.q("SELECT l.*, (SELECT COUNT(*) FROM items i WHERE i.library_id=l.id AND i.missing_at IS NULL) "
@@ -6014,7 +6283,7 @@ class App:
         assert self.httpd
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(cert, key)
-        self.httpd.socket = ctx.wrap_socket(self.httpd.socket, server_side=True)
+        self.httpd.socket = ctx.wrap_socket(self.httpd.socket, server_side=True, do_handshake_on_connect=False)
         self.tls = True
 
     def advertise_mdns(self) -> None:
@@ -6497,7 +6766,7 @@ def _mk_item(container: str = "mp4", vcodec: str = "h264", profile: str = "High"
 
 
 CHROME = {"video": ["h264", "vp9", "av1"], "audio": ["aac", "mp3", "opus", "flac"], "containers": ["mp4", "webm"]}
-SAFARI = {"video": ["h264", "hevc"], "audio": ["aac", "mp3", "ac3", "eac3"], "containers": ["mp4"],
+SAFARI = {"video": ["h264", "hevc", "hevc10"], "audio": ["aac", "mp3", "ac3", "eac3"], "containers": ["mp4"],
           "audioTracks": True, "hdr": ["hdr10"]}
 OLD_TV = {"video": ["h264"], "audio": ["aac", "mp3", "ac3"], "containers": ["mp4"]}
 OPTS = {"ffmpeg": True, "allow_transcode": True, "allow_passthrough": False, "prefer_direct": True, "quality": "auto",
@@ -7029,6 +7298,9 @@ def cmd_serve(args: argparse.Namespace, paths: Paths) -> int:
     finally:
         app.stop()
         CHILDREN.kill_all()
+        if PLAT.is_termux and shutil.which("termux-wake-unlock"):
+            with contextlib.suppress(OSError):
+                subprocess.Popen(["termux-wake-unlock"], **popen_kwargs(False))
         with contextlib.suppress(Exception):
             app.httpd.server_close()  # type: ignore[union-attr]
         app.db.close_all()
@@ -7183,7 +7455,7 @@ INDEX_HTML = r"""<!doctype html>
 <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M16 8V5.5a1.5 1.5 0 0 0-1.5-1.5h-9A1.5 1.5 0 0 0 4 5.5v9A1.5 1.5 0 0 0 5.5 16H8" fill="none" stroke="currentColor" stroke-width="2"/></symbol>
 <symbol id="i-chapters" viewBox="0 0 24 24"><path d="M4 6h16M4 12h10M4 18h13" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></symbol>
 </svg>
-<div id="app" role="application" aria-busy="true">
+<div id="app" aria-busy="true">
   <div class="boot"><div class="boot-logo"><span>Local</span><b>Flix</b></div><div class="boot-bar"></div>
   <noscript><p>LocalFlix needs JavaScript enabled.</p></noscript></div>
 </div>
@@ -7201,14 +7473,20 @@ APP_CSS = r"""
   --text:#F5F5F7;--muted:#A1A1AA;--dim:#71717A;--accent:#E5484D;--accent-ink:#fff;--ok:#30A46C;--warn:#FFB224;--err:#E5484D;
   --radius:10px;--radius-lg:16px;--shadow:0 10px 40px rgba(0,0,0,.55);--ease:cubic-bezier(.2,.8,.2,1);
   --font:Inter,"Segoe UI Variable","Segoe UI",-apple-system,BlinkMacSystemFont,"SF Pro Text",Roboto,system-ui,"Noto Sans","Noto Sans Devanagari",sans-serif;
-  --pad:4vw;--card-w:clamp(160px,18vw,300px);--nav-h:68px;--fs-base:clamp(14px,.35vw + 12px,17px);
+  --pad:4vw;--card-w:18vw;--nav-h:68px;--fs-base:15px;
   --scale:1;
 }
 html[data-theme="oled"]{--bg:#000;--bg2:#050507;--surface:#0D0D12;--surface2:#16161E;--surface3:#20202A}
 html[data-theme="light"]{--bg:#F6F6F8;--bg2:#ECECF1;--surface:#fff;--surface2:#F1F1F5;--surface3:#E4E4EB;--line:rgba(0,0,0,.1);
   --text:#16161D;--muted:#55555F;--dim:#7A7A85;--shadow:0 10px 30px rgba(0,0,0,.15)}
-html[data-cards="s"]{--card-w:clamp(130px,14vw,230px)}
-html[data-cards="l"]{--card-w:clamp(200px,24vw,380px)}
+html[data-cards="s"]{--card-w:14vw}
+html[data-cards="l"]{--card-w:24vw}
+/* clamp() inside custom properties only where supported (older TV Chromium would drop the whole value) */
+@supports (width:clamp(1px,1vw,2px)){
+  :root{--card-w:clamp(160px,18vw,300px);--fs-base:clamp(14px,.35vw + 12px,17px)}
+  html[data-cards="s"]{--card-w:clamp(130px,14vw,230px)}
+  html[data-cards="l"]{--card-w:clamp(200px,24vw,380px)}
+}
 *{box-sizing:border-box}
 html{font-size:calc(var(--fs-base) * var(--scale));-webkit-text-size-adjust:100%;background:var(--bg)}
 body{margin:0;background:var(--bg);color:var(--text);font-family:var(--font);line-height:1.45;-webkit-font-smoothing:antialiased;overflow-x:hidden;min-height:100vh}
@@ -7219,7 +7497,8 @@ img{display:block;max-width:100%}
 .ico{width:1.25em;height:1.25em;display:inline-block;vertical-align:middle;flex:none}
 .sr{position:absolute!important;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
 :focus{outline:none}
-:focus-visible,.focus-ring:focus,html[data-tv] :focus{outline:3px solid var(--accent);outline-offset:3px}
+:focus-visible{outline:3px solid var(--accent);outline-offset:3px}
+.focus-ring:focus,html[data-tv] :focus{outline:3px solid var(--accent);outline-offset:3px}
 html[data-tv] *{cursor:none!important}
 .hidden{display:none!important}
 
@@ -7295,7 +7574,7 @@ html[data-theme="light"] .nav.solid{background:rgba(246,246,248,.95)}
 .banner .grow{flex:1;min-width:200px;margin-right:1em}
 
 /* hero */
-.hero{position:relative;height:min(82vh,56.25vw + 80px);min-height:420px;overflow:hidden;margin-bottom:-6vw}
+.hero{position:relative;height:82vh;height:min(82vh,56.25vw + 80px);min-height:420px;overflow:hidden;margin-bottom:-6vw}
 .hero-bg{position:absolute;top:0;left:0;right:0;bottom:0;background-size:cover;background-position:center 20%;transition:opacity .8s;opacity:0}
 .hero-bg.on{opacity:1}
 .hero:after{content:"";position:absolute;top:0;left:0;right:0;bottom:0;pointer-events:none;
@@ -7477,7 +7756,7 @@ select.input{padding-right:2em}
 .who{min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:4vh 4vw;text-align:center}
 .who h1{font-size:clamp(1.8rem,3.6vw,3.2rem);font-weight:700;margin:0 0 1.2em;letter-spacing:-.02em}
 .who-list{display:flex;flex-wrap:wrap;justify-content:center;max-width:1100px}
-.who-p{width:clamp(110px,11vw,190px);margin:0 1.2vw 2.4vw;display:flex;flex-direction:column;align-items:center;color:var(--muted);border-radius:12px;padding:6px;transition:color .2s}
+.who-p{width:11vw;min-width:110px;max-width:190px;margin:0 1.2vw 2.4vw;display:flex;flex-direction:column;align-items:center;color:var(--muted);border-radius:12px;padding:6px;transition:color .2s}
 .who-p .avatar{width:100%;height:auto;padding-top:100%;position:relative;border-radius:14px;font-size:clamp(2.6rem,4.4vw,5rem);transition:transform .2s var(--ease),box-shadow .2s}
 .who-p .avatar span{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%)}
 .who-p:hover,.who-p:focus{color:var(--text)}
@@ -7597,7 +7876,9 @@ select.input{padding-right:2em}
 .osd{position:absolute;top:18%;left:50%;transform:translateX(-50%);background:rgba(0,0,0,.6);padding:.5em 1em;border-radius:8px;font-weight:700;font-size:1.1rem;pointer-events:none}
 
 /* TV (10-foot) */
-html[data-tv]{--fs-base:22px;--pad:5vw;--card-w:clamp(220px,17vw,340px);--nav-h:84px}
+html[data-tv]{--fs-base:22px;--pad:5vw;--card-w:17vw;--nav-h:84px}
+@supports (width:clamp(1px,1vw,2px)){html[data-tv]{--card-w:clamp(220px,17vw,340px)}}
+html[data-tv] .scroller{padding-top:32px;padding-bottom:40px}
 html[data-tv] .nav{padding:0 5vw}
 html[data-tv] .nav-links a{font-size:1.05rem;padding:.5em .7em;border-radius:8px;margin-right:.5vw}
 html[data-tv] .nav-links a:focus{background:var(--text);color:var(--bg);outline:none}
@@ -7648,7 +7929,10 @@ html[data-motion="reduce"] *,html[data-motion="reduce"] *:before,html[data-motio
   .mini{display:none}
 }
 @media (max-width:480px){.btn{padding:0 1em}.who-p{width:28vw}.hero-title{font-size:1.9rem}}
-@media (min-width:1600px){:root{--card-w:clamp(240px,15vw,340px)}}
+@media (min-width:1600px){:root{--card-w:15vw}}
+@supports (width:clamp(1px,1vw,2px)){@media (min-width:1600px){:root{--card-w:clamp(240px,15vw,340px)}}}
+/* grid layout sizes cards itself: neutralise the flex fallback widths above */
+@supports (display:grid){.grid>.card,.grid>.card.poster{width:auto}}
 @media (hover:none){.row-arrow{display:none}.card:hover{transform:none}}
 @media print{.nav,.tabbar,#toasts{display:none}}
 """
@@ -7702,7 +7986,7 @@ function debounce(fn, ms) { var t; return function () { var a = arguments, s = t
 function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
 function pad2(n) { return (n < 10 ? '0' : '') + n; }
 function fmtTime(s) { s = Math.max(0, Math.floor(s || 0)); var hh = Math.floor(s / 3600), mm = Math.floor(s % 3600 / 60), ss = s % 60; return (hh ? hh + ':' + pad2(mm) : mm) + ':' + pad2(ss); }
-function fmtDur(s) { s = Math.round((s || 0) / 60); if (s < 60) return s + t('u.min'); return Math.floor(s / 60) + t('u.h') + ' ' + (s % 60) + t('u.min'); }
+function fmtDur(s) { s = (s || 0) > 0 ? Math.max(1, Math.round(s / 60)) : 0; if (s < 60) return s + t('u.min'); return Math.floor(s / 60) + t('u.h') + ' ' + (s % 60) + t('u.min'); }
 function fmtSize(b) { if (!b) return ''; var u = ['B', 'KB', 'MB', 'GB', 'TB'], i = 0; while (b >= 1024 && i < 4) { b /= 1024; i++; } return b.toFixed(i > 2 ? 1 : 0) + ' ' + u[i]; }
 function hashColor(s) { var x = 0, i; s = s || ''; for (i = 0; i < s.length; i++) x = (x * 31 + s.charCodeAt(i)) | 0; var hu = Math.abs(x) % 360; return 'linear-gradient(135deg,hsl(' + hu + ',45%,28%),hsl(' + ((hu + 50) % 360) + ',55%,14%))'; }
 function store(k, v) { try { if (v === undefined) { var r = localStorage.getItem('lf.' + k); return r ? JSON.parse(r) : null; } localStorage.setItem('lf.' + k, JSON.stringify(v)); } catch (e) { return null; } }
@@ -7881,7 +8165,8 @@ function applySettings() {
   var scale = (v.ui_scale || 100) / 100; root.style.setProperty('--scale', scale);
 }
 function loadSettings() {
-  return api('/settings').then(function (d) { S.settings = d.values || {}; S.admin = !!d.admin; applySettings(); });
+  return api('/settings').then(function (d) { S.settings = d.values || {}; S.admin = !!d.admin; applySettings(); })
+    .catch(function (e) { if (e.status !== 409) throw e; applySettings(); });  /* 409: pick a profile first */
 }
 
 /* ===== spatial navigation (TV / keyboard) ===== */
@@ -7992,7 +8277,7 @@ function goBack() {
     if (Date.now() - lastBack < 2200) { exitApp(); return; }
     lastBack = Date.now(); toast(t('toast.exit')); return;
   }
-  if (S.navCount > 0) history.back(); else go('home');
+  if (histDepth() > 0) history.back(); else go('home', true);
 }
 document.addEventListener('keydown', function (e) {
   var k = keyName(e);
@@ -8012,10 +8297,22 @@ document.addEventListener('keydown', function (e) {
   }
   if (k === 'ok') {
     var c = document.activeElement;
-    if (c && c.classList && c.classList.contains('card') && e.repeat) { e.preventDefault(); quickActions(c); return; }
+    if (c && c.classList && c.classList.contains('card')) {
+      /* OK opens on release; holding OK (TV long-press) opens quick actions instead */
+      e.preventDefault();
+      if (!e.repeat && !c._pressT) c._pressT = setTimeout(function () { c._pressT = null; c._longDone = true; quickActions(c); }, 600);
+      return;
+    }
     if (c && c.getAttribute && c.getAttribute('role') === 'switch') { e.preventDefault(); c.click(); }
   }
   if (e.key === '/' && !isTyping() && !(LF.Player && LF.Player.active())) { e.preventDefault(); go('search'); }
+});
+document.addEventListener('keyup', function (e) {
+  if (keyName(e) !== 'ok') return;
+  var c = document.activeElement;
+  if (!c || !c.classList || !c.classList.contains('card')) return;
+  if (c._pressT) { clearTimeout(c._pressT); c._pressT = null; go(c.getAttribute('href').slice(2)); }
+  else c._longDone = false;
 });
 /* Gamepad D-pad (optional) */
 (function () {
@@ -8027,7 +8324,10 @@ document.addEventListener('keydown', function (e) {
       var p = pads[i]; if (!p) continue; any = true;
       [[12, 38], [13, 40], [14, 37], [15, 39], [0, 13], [1, 27], [9, 179]].forEach(function (m) {
         var b = p.buttons[m[0]], on = b && b.pressed, key = i + ':' + m[0];
-        if (on && !prev[key]) document.dispatchEvent(new KeyboardEvent('keydown', { keyCode: m[1], which: m[1], bubbles: true }));
+        if (on && !prev[key]) {
+          if (m[1] === 13) { var ae = document.activeElement; if (ae && ae !== document.body && ae.click) ae.click(); }
+          else document.dispatchEvent(new KeyboardEvent('keydown', { key: { 38: 'ArrowUp', 40: 'ArrowDown', 37: 'ArrowLeft', 39: 'ArrowRight', 27: 'Escape', 179: 'MediaPlayPause' }[m[1]], bubbles: true }));
+        }
         prev[key] = on;
       });
     }
@@ -8043,17 +8343,28 @@ function parseHash() {
   var parts = raw.split('/').filter(Boolean).map(decodeURIComponent);
   return { name: parts[0] || 'home', args: parts.slice(1), q: parseQS(q), raw: raw };
 }
+/* history depth lives in history.state so Back never leaves the app by accident */
+function histDepth() { return (history.state && history.state.lfd) || 0; }
 function go(path, replace) {
   var hsh = '#/' + path;
-  if (replace) location.replace(hsh); else location.hash = hsh;
+  try {
+    if (replace) history.replaceState({ lfd: histDepth() }, '', hsh);
+    else if (location.hash !== hsh) history.pushState({ lfd: histDepth() + 1 }, '', hsh);
+  } catch (e) { if (replace) location.replace(hsh); else location.hash = hsh; return; }
+  route();
 }
-LF.go = go; LF.parseHash = parseHash;
+document.addEventListener('click', function (e) {
+  var a = e.target && e.target.closest ? e.target.closest('a[href^="#/"]') : null;
+  if (!a || e.defaultPrevented || e.button || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+  e.preventDefault();
+  go(a.getAttribute('href').slice(2));
+});
+LF.go = go; LF.parseHash = parseHash; LF.canBack = function () { return histDepth() > 0; };
 var PAGES = {};
 var OVERLAY_ROUTES = { item: 1, series: 1, watch: 1 };
 var root, pageEl, navEl, tabEl;
 var firstRoute = true;
 function route() {
-  if (!firstRoute) S.navCount++;
   firstRoute = false;
   var r = parseHash();
   closeMenus();
@@ -8079,6 +8390,7 @@ function renderPage(r) {
   var fn = PAGES[r.name] || PAGES.notfound;
   S.page = r.name; S.pageKey = r.name + '/' + r.args.join('/') + '?' + qs(r.q);
   if (S.pageAbort) S.pageAbort.abort();
+  if (S.pageCleanup) { try { S.pageCleanup(); } catch (e) { /* ignore */ } S.pageCleanup = null; }
   S.pageAbort = window.AbortController ? new AbortController() : null;
   clear(pageEl); window.scrollTo(0, 0);
   var full = r.name === 'profiles' || r.name === 'login';
@@ -8123,7 +8435,7 @@ function renderNav() {
     prof ? avatar(prof.avatar) : h('div.avatar', { style: { background: 'var(--surface3)' } }, icon('user')));
   var tvb = (S.settings.show_tv_button !== false && !S.tv) ? h('button.btn.btn-ghost.btn-sm.nav-tvbtn', { onclick: openTvModal }, icon('tv'), t('nav.tv')) : null;
   append(navEl, [h('a.logo', { href: '#/home', 'aria-label': 'LocalFlix home' }, h('span', 'Local'), h('b', 'Flix')), links, h('div.nav-spacer'),
-    h('div.nav-act', sbox, tvb, pbtn)]);
+    h('div.nav-act.rel', sbox, tvb, pbtn)]);
   clear(tabEl);
   [['home', 'nav.home', 'home'], ['shows', 'nav.shows', 'episodes'], ['movies', 'nav.movies', 'film'], ['search', 'nav.search', 'search'], ['mylist', 'nav.mylist', 'plus']].forEach(function (n) {
     tabEl.appendChild(h('a', { href: '#/' + n[0], 'data-nav': n[0] }, icon(n[2]), h('span', t(n[1]))));
@@ -8143,7 +8455,7 @@ function profileMenu(anchor) {
   if (S.tv || window.innerWidth < 769) items.push(h('button', { onclick: openTvModal }, icon('tv'), t('nav.tv')));
   if (S.auth && S.auth.required) { items.push(h('hr')); items.push(h('button', { onclick: function () { api('/auth/logout', { method: 'POST' }).then(function () { location.reload(); }); } }, icon('lock'), t('nav.signout'))); }
   var m = h('div.menu', { role: 'menu' }, items);
-  anchor.appendChild(m);
+  (anchor.parentNode || anchor).appendChild(m);
   setTimeout(function () { Nav.focus($('button,a', m)); }, 10);
 }
 function switchProfile() { S.auth.profile = null; go('profiles'); }
@@ -8172,7 +8484,7 @@ function modal(content, opts) {
 }
 LF.modal = modal;
 function routeModal(content) {
-  return modal(content, { onclose: function (silent) { if (silent) return; if (S.navCount > 0) history.back(); else go(S.page || 'home', true); } });
+  return modal(content, { onclose: function (silent) { if (silent) return; if (histDepth() > 0) history.back(); else go(S.page || 'home', true); } });
 }
 function closeOverlays(silent) { $$('.overlay').forEach(function (o) { if (o._close) o._close(silent); else o.remove(); }); document.body.style.overflow = ''; }
 
@@ -8252,11 +8564,12 @@ function miniCard(el, it) {
 function quickActions(el) {
   var it = el._item; if (!it) return;
   closeMenus();
-  var m = h('div.menu', { role: 'menu', style: { left: '0', right: 'auto', top: '100%' } },
+  var r = el.getBoundingClientRect();
+  var m = h('div.menu', { role: 'menu', style: { position: 'fixed', left: Math.max(8, r.left) + 'px', right: 'auto', top: Math.min(r.bottom + 6, window.innerHeight - 200) + 'px' } },
     h('button', { onclick: function () { toggleList(it); m.remove(); } }, icon(it.inList ? 'check' : 'plus'), it.inList ? t('b.inlist') : t('b.mylist')),
     it.kind !== 'series' ? h('button', { onclick: function () { toggleWatched(it); m.remove(); } }, icon('check'), it.watched ? t('b.markunwatched') : t('b.markwatched')) : null,
-    h('button', { onclick: function () { m.remove(); location.hash = it.kind === 'series' ? '#/series/' + it.id : '#/item/' + it.id; } }, icon('info'), t('b.more')));
-  el.style.position = 'relative'; el.appendChild(m);
+    h('button', { onclick: function () { m.remove(); go((it.kind === 'series' ? 'series/' : 'item/') + it.id); } }, icon('info'), t('b.more')));
+  document.body.appendChild(m);
   setTimeout(function () { Nav.focus($('button', m)); }, 10);
 }
 function toggleList(it, btn) {
@@ -8380,8 +8693,8 @@ var refreshSoon = debounce(function () {
       window.scrollTo(0, y);
       if (focusedId) { var f = $('[data-id="' + focusedId + '"]', rowsBox); if (f) Nav.focus(f); }
     });
-  } else if (S.page === 'shows' || S.page === 'movies' || S.page === 'new' || S.page === 'mylist') {
-    if (!$('.overlay') && !(LF.Player && LF.Player.active()) && !S.tv) { var yy = window.pageYOffset; S.pageKey = ''; route(); window.scrollTo(0, yy); }
+  } else if (S.page === 'mylist' && !$('.overlay') && !(LF.Player && LF.Player.active())) {
+    S.pageKey = ''; route();  /* small page; browse grids are left alone so scroll/paging survive */
   }
 }, 1500);
 LF.refreshSoon = refreshSoon;
@@ -8397,11 +8710,11 @@ function browsePage(cfg) {
     function setQ(patch) { var nq = {}; Object.keys(q).forEach(function (k) { nq[k] = q[k]; }); Object.keys(patch).forEach(function (k) { nq[k] = patch[k]; }); go(r.name + '?' + qs(nq), true); }
     if (!cfg.nosort) {
       tb.appendChild(h('select', { 'aria-label': 'Sort', onchange: function () { setQ({ sort: this.value }); } },
-        ['added', 'title', 'year', 'duration', 'rating'].map(function (s) { return h('option', { value: s, selected: s === sort }, t('sort.' + s)); })));
-      [['unwatched', 'f.unwatched'], ['multiaudio', 'f.multiaudio'], ['hdr', 'f.hdr']].forEach(function (f) {
+        (cfg.type === 'series' ? ['added', 'title', 'year', 'rating'] : ['added', 'title', 'year', 'duration', 'rating']).map(function (s) { return h('option', { value: s, selected: s === sort }, t('sort.' + s)); })));
+      if (cfg.type !== 'series') [['unwatched', 'f.unwatched'], ['multiaudio', 'f.multiaudio'], ['hdr', 'f.hdr']].forEach(function (f) {
         tb.appendChild(h('button.chip' + (q[f[0]] === '1' ? '.on' : ''), { 'aria-pressed': q[f[0]] === '1' ? 'true' : 'false', onclick: function () { var p = {}; p[f[0]] = q[f[0]] === '1' ? '' : '1'; setQ(p); } }, t(f[1])));
       });
-      [['4K', 'f.4k'], ['1080p', 'f.1080'], ['720p', 'f.720']].forEach(function (f) {
+      if (cfg.type !== 'series') [['4K', 'f.4k'], ['1080p', 'f.1080'], ['720p', 'f.720']].forEach(function (f) {
         tb.appendChild(h('button.chip' + (q.res === f[0] ? '.on' : ''), { onclick: function () { setQ({ res: q.res === f[0] ? '' : f[0] }); } }, t(f[1])));
       });
       if (cfg.type !== 'series') api('/genres').then(function (g) {
@@ -8430,6 +8743,7 @@ function browsePage(cfg) {
     if (io) {
       var sio = new IntersectionObserver(function (en) { if (en[0].isIntersecting) load(); }, { rootMargin: '800px' });
       setTimeout(function () { sio.observe(moreBox); }, 100);
+      S.pageCleanup = function () { sio.disconnect(); };
     }
     return load();
   };
@@ -8466,8 +8780,8 @@ PAGES.search = function (el, r) {
   var ctrl = null;
   var run = debounce(function () {
     var v = input.value.trim();
-    history.replaceState(null, '', '#/search' + (v ? '?q=' + encodeURIComponent(v) : ''));
-    S.pageKey = 'search/?' + (v ? 'q=' + v : '');
+    history.replaceState({ lfd: histDepth() }, '', '#/search' + (v ? '?q=' + encodeURIComponent(v) : ''));
+    S.pageKey = 'search/?' + qs({ q: v });
     if (ctrl) ctrl.abort();
     ctrl = window.AbortController ? new AbortController() : null;
     clear(results);
@@ -8544,10 +8858,11 @@ function openSeries(id) {
     clear(box);
     var eps = h('div', { 'data-row': 'eps' });
     var nu = s.nextUp;
-    var curSeason = nu ? (nu.season || 1) : (s.seasons[0] ? s.seasons[0].number : 1);
+    function sn(e) { return e.season === null || e.season === undefined ? 1 : e.season; }
+    var curSeason = nu ? sn(nu) : (s.seasons[0] ? s.seasons[0].number : 1);
     function renderEps() {
       clear(eps);
-      s.episodes.filter(function (e) { return (e.season || 1) === curSeason; }).forEach(function (e) {
+      s.episodes.filter(function (e) { return sn(e) === curSeason; }).forEach(function (e) {
         eps.appendChild(h('a.ep', { href: '#/watch/' + e.id, 'data-id': e.id },
           h('div.ep-n', e.episode !== null && e.episode !== undefined ? e.episode : '•'),
           h('div.ep-thumb', { style: { background: hashColor(e.title) } }, h('div'), lazyImg(e.thumb + '?w=320'),
@@ -8710,10 +9025,11 @@ function saveSetting(key, val, spec) {
   var body = {}; body[key] = val;
   return api('/settings' + (spec.scope === 'server' ? '?scope=server' : ''), { method: 'PUT', body: { values: body } }).then(function (d) {
     if (d.errors && d.errors[key]) { toast(d.errors[key], 'err'); return; }
+    if (spec.type === 'list' && typeof val === 'string') val = val.split(',').map(function (x) { return x.trim(); }).filter(Boolean);
     S.settings[key] = val; applySettings();
     if (key === 'language' || key === 'show_tv_button') { renderNav(); S.pageKey = ''; route(); }
     toast(d.restartRequired ? t('set.saved') + ' · ' + t('set.restart') : t('set.saved'), 'ok', null, 1400);
-  }).catch(function (e) { toast(e.message, 'err'); });
+  }).catch(function (e) { toast((e.data && e.data.errors && e.data.errors[key]) || e.message, 'err'); });
 }
 function control(spec) {
   var key = spec.key, val = S.settings[key], dis = spec.admin && !S.admin || (spec.scope === 'server' && !S.admin);
@@ -8930,7 +9246,7 @@ function connectEvents() {
   if (!window.EventSource) return;
   try { es = new EventSource('/api/v1/events'); } catch (e) { return; }
   es.onopen = function () {
-    clearTimeout(offlineTimer);
+    clearTimeout(offlineTimer); offlineTimer = null;
     if (offlineToast) { offlineToast.remove(); offlineToast = null; toast(t('toast.online'), 'ok'); refreshSoon(); }
     S.online = true;
   };
@@ -8970,9 +9286,10 @@ function boot() {
   registerTvKeys();
   if (S.tv) document.documentElement.setAttribute('data-tv', '1');
   Promise.all([refreshInfo(), refreshAuth()]).then(function () {
-    if (S.auth.required && !S.auth.authenticated) { buildShell(); route(); return null; }
+    if (S.auth.required && !S.auth.authenticated) { buildShell(); window.addEventListener('hashchange', route); route(); return null; }
     return loadSettings().then(function () {
-      if (S.info.profilesEnabled === false && !S.auth.profile) return api('/profiles').then(function (d) { return api('/profiles/' + d.profiles[0].id + '/select', { method: 'POST', body: {} }); }).then(function (p) { S.auth.profile = p; });
+      if (S.info.profilesEnabled === false && !S.auth.profile) return api('/profiles').then(function (d) { return api('/profiles/' + d.profiles[0].id + '/select', { method: 'POST', body: {} }); }).then(function (p) { S.auth.profile = p; })
+        .catch(function () { /* PIN-protected: the profiles page shows the PIN pad */ });
       return null;
     }).then(function () {
       buildShell();
@@ -9074,7 +9391,11 @@ function cueNode(text) {
 }
 
 /* --- player core --- */
-function pos() { return P ? (P.offset || 0) + (P.video.currentTime || 0) : 0; }
+function pos() {
+  if (!P) return 0;
+  if (P.pendingPos !== null && P.pendingPos !== undefined) return P.pendingPos;
+  return (P.offset || 0) + (P.video.currentTime || 0);
+}
 function dur() { return P ? (P.pb && P.pb.durationSec) || P.video.duration || 0 : 0; }
 function isSimple() { return P && P.pb && P.pb.mode === 'simple'; }
 function settings() { return S.settings || {}; }
@@ -9175,9 +9496,12 @@ function negotiate(o) {
   if (o.force) body.force = o.force; else if (P.force) body.force = P.force;
   body.quality = o.quality || P.quality || null;
   if (P.pb && P.pb.sessionId) body.replaceSession = P.pb.sessionId;
-  var myP = P;
+  var myP = P, seq = P.negSeq = (P.negSeq || 0) + 1;
   return api('/items/' + P.id + '/playback', { method: 'POST', body: body }).then(function (pb) {
-    if (P !== myP) return null;
+    if (P !== myP || seq !== myP.negSeq) {
+      if (pb && pb.sessionId) api('/hls/' + pb.sessionId, { method: 'DELETE' }).catch(function () { /* gone */ });
+      return null;
+    }
     if (body.force) P.force = body.force;
     return pb;
   });
@@ -9185,16 +9509,20 @@ function negotiate(o) {
 function destroyHls() { if (P && P.hls) { try { P.hls.destroy(); } catch (e) { /* ignore */ } P.hls = null; } }
 function load(pb, start) {
   var first = !P.pb;
-  P.pb = pb; P.offset = pb.timeOffset || 0; P.ended = false; P.netRetries = 0;
+  P.pb = pb; P.offset = pb.timeOffset || 0; P.ended = false; P.netRetries = 0; P.pendingPos = start || 0;
   if (P.audioIndex === null || P.audioIndex === undefined) P.audioIndex = pb.audioIndex;
   if (pb.item) setTitle(pb.item);
-  P.burnIdx = (pb.method === 'transcode' && pb.subtitleIndex !== null && pb.subtitles[pb.subtitleIndex] && pb.subtitles[pb.subtitleIndex].kind === 'image') ? pb.subtitleIndex : null;
+  var selSub = pb.subtitleIndex === null || pb.subtitleIndex === undefined ? null : pb.subtitles.filter(function (x) { return x.index === pb.subtitleIndex; })[0];
+  P.burnIdx = (pb.method === 'transcode' && selSub && selSub.kind === 'image') ? pb.subtitleIndex : null;
+  if (P.burnIdx !== null) P.subIndex = P.burnIdx;
   var v = P.video;
   destroyHls();
+  if (P.seekFn) { v.removeEventListener('loadedmetadata', P.seekFn); P.seekFn = null; }
+  P.loading = true;  // suppress 'paused' reports caused by swapping the source
   v.removeAttribute('src'); try { v.load(); } catch (e) { /* ignore */ }
   var localStart = isSimple() ? 0 : start;
   updateButtons();
-  if (first && pb.subtitleIndex !== null && pb.subtitleIndex !== undefined && pb.subtitles[pb.subtitleIndex] && pb.subtitles[pb.subtitleIndex].kind === 'text') loadSubs(pb.subtitleIndex);
+  if (first && selSub && selSub.kind === 'text') loadSubs(pb.subtitleIndex);
   if (pb.method === 'direct') {
     v.src = pb.url;
     seekWhenReady(localStart);
@@ -9232,9 +9560,10 @@ function load(pb, start) {
   });
 }
 function seekWhenReady(t0) {
-  if (!t0) return;
   var v = P.video;
-  var fn = function () { v.removeEventListener('loadedmetadata', fn); try { v.currentTime = t0; } catch (e) { /* ignore */ } };
+  if (P.seekFn) { v.removeEventListener('loadedmetadata', P.seekFn); P.seekFn = null; }
+  if (!t0) return;
+  var fn = P.seekFn = function () { v.removeEventListener('loadedmetadata', fn); if (P) P.seekFn = null; try { v.currentTime = t0; } catch (e) { /* ignore */ } };
   if (v.readyState >= 1) fn(); else v.addEventListener('loadedmetadata', fn);
 }
 function play() {
@@ -9255,9 +9584,8 @@ function onHlsError(Hls, data) {
   }
   var code = data.response && data.response.code;
   if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-    if (code === 404) { restart({}, true); return; }
-    if (P.netRetries++ < 3) { setTimeout(function () { if (P && P.hls) P.hls.startLoad(); }, 1000 * P.netRetries); return; }
-    restart({}, true); return;
+    if (P.netRetries++ < 3 && code !== 404) { setTimeout(function () { if (P && P.hls) P.hls.startLoad(); }, 1000 * P.netRetries); return; }
+    if ((P.restarts = (P.restarts || 0) + 1) <= 2) { restart({}, true); return; }
   }
   if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
     P.mediaRetries++;
@@ -9281,14 +9609,14 @@ function fallbackOrError(msg) {
 function restart(o, silent) {
   o = o || {};
   var at = o.t !== undefined ? o.t : pos();
-  var wasPaused = P.video.paused && !P.waitingSince && !silent ? false : false;
+  var wasPaused = !silent && P.video.paused && !P.loading && !!P.pb;
   spinner(t('p.preparing'));
   if (o.quality) P.quality = o.quality;
   return negotiate({ startTime: at, audioIndex: o.audioIndex, subtitleIndex: o.subtitleIndex, force: o.force, quality: o.quality }).then(function (pb) {
     if (!pb) return;
     if (o.audioIndex !== undefined) P.audioIndex = o.audioIndex;
     load(pb, at);
-    if (wasPaused) P.video.pause();
+    if (wasPaused) { var vv = P.video; vv.addEventListener('playing', function once() { vv.removeEventListener('playing', once); vv.pause(); }); }
   }).catch(function (e) { showError(e.message); });
 }
 function hlsAudioIdx(sidx) {
@@ -9355,6 +9683,7 @@ function seekTo(target) {
     if (target < P.offset - 0.5 || target > endAbs - 2) { restart({ t: target }); return; }
     v.currentTime = target - P.offset;
   } else {
+    if (P.pendingPos !== null && P.pendingPos !== undefined) P.pendingPos = target;
     P.video.currentTime = target;
   }
   renderSubs(true); tick();
@@ -9386,6 +9715,7 @@ function setFit(f) {
 }
 function playNext() {
   var n = P && P.pb && P.pb.next; if (!n) return;
+  P.ended = true;
   report('ended');
   LF.go('watch/' + n.id, true);
 }
@@ -9477,9 +9807,12 @@ function smartFeatures(p, d) {
     if (LF.S.tv) setTimeout(function () { LF.Nav.focus(skip); }, 20);
   } else if (!want && skip) skip.remove();
   // next episode card
+  var cstart = mk.credits ? mk.credits.start : (st.credits_fallback !== false && pb.item && pb.item.kind === 'episode' ? d - 45 : null);
   if (pb.next && !P.nextShown && !P.nextDismissed && d > 0) {
-    var cstart = mk.credits ? mk.credits.start : (st.credits_fallback !== false && pb.item && pb.item.kind === 'episode' ? d - 45 : null);
     if (cstart !== null && p >= cstart && p < d - 0.5) showNext(true);
+  } else if (P.nextShown && cstart !== null && p < cstart - 1) {
+    var nc = $('.nextcard', P.root); if (nc) nc.remove();
+    clearInterval(P.countdown); P.nextShown = false; P.nextDismissed = false;
   }
   if (P.sleepAt && Date.now() >= P.sleepAt) { P.sleepAt = null; sleepFire(); }
 }
@@ -9503,7 +9836,11 @@ function showNext(countdown) {
       if (P.video.paused) return;
       left -= 1; label.textContent = t('p.nextin', Math.max(0, left));
       if (rc) rc.setAttribute('stroke-dashoffset', String(ringC * (1 - left / secs)));
-      if (left <= 0) { clearInterval(P.countdown); playNext(); }
+      if (left <= 0) {
+        clearInterval(P.countdown);
+        if (P.sleepEnd) { P.sleepEnd = false; card.remove(); sleepFire(); return; }
+        playNext();
+      }
     }, 1000);
   }
 }
@@ -9522,7 +9859,7 @@ function onEnded() {
 }
 function sleepFire() {
   P.video.pause();
-  var d = h('div.p-dialog', h('h3', t('p.still')), h('button.btn.btn-primary', { 'data-autofocus': true, onclick: function () { d.remove(); play(); } }, t('p.continue')),
+  var d = h('div.p-dialog', h('h3', t('p.still')), h('button.btn.btn-primary', { 'data-autofocus': true, onclick: function () { d.remove(); if (P.ended && P.pb.next) playNext(); else play(); } }, t('p.continue')),
     h('button.btn.btn-ghost', { onclick: function () { close(); } }, t('b.back')));
   P.root.appendChild(d); setTimeout(function () { LF.Nav.focus($('[data-autofocus]', d)); }, 20);
 }
@@ -9672,11 +10009,12 @@ function hidePreview() { if (P) P.els.preview.style.display = 'none'; }
 /* --- events wiring --- */
 function wire() {
   var v = P.video, els = P.els, root = P.root;
-  ['play', 'pause', 'volumechange'].forEach(function (ev) { v.addEventListener(ev, function () { updateButtons(); if (ev === 'pause') { showUi(); report('paused'); } }); });
-  v.addEventListener('playing', function () { hideSpinner(); P.waitingSince = 0; P.mediaRetries = 0; showUi(); if (settings().auto_fullscreen && !LF.S.tv && !P.fsTried && !/Mobi/.test(navigator.userAgent)) { P.fsTried = true; if (!document.fullscreenElement) toggleFs(); } });
+  ['play', 'pause', 'volumechange'].forEach(function (ev) { v.addEventListener(ev, function () { updateButtons(); if (ev === 'pause' && !P.loading) { showUi(); report('paused'); } }); });
+  v.addEventListener('playing', function () { hideSpinner(); P.waitingSince = 0; P.mediaRetries = 0; P.restarts = 0; P.loading = false; P.pendingPos = null; showUi(); if (settings().auto_fullscreen && !LF.S.tv && !P.fsTried && !/Mobi/.test(navigator.userAgent)) { P.fsTried = true; if (!document.fullscreenElement) toggleFs(); } });
   v.addEventListener('waiting', function () { P.waitingSince = Date.now(); setTimeout(function () { if (P && P.waitingSince && Date.now() - P.waitingSince >= 350) spinner(P.pb && P.pb.method !== 'direct' ? t('p.preparing') : t('p.buffering')); }, 400); });
   v.addEventListener('canplay', function () { if (!v.paused) hideSpinner(); });
-  v.addEventListener('seeked', LF.debounce(function () { report('playing'); }, 800));
+  v.addEventListener('seeked', function () { if (P && !P.loading) P.pendingPos = null; });
+  v.addEventListener('seeked', LF.debounce(function () { if (P) report('playing'); }, 800));
   v.addEventListener('timeupdate', tick);
   v.addEventListener('ended', function () { if (!isSimple() || pos() >= dur() - 2) onEnded(); });
   v.addEventListener('error', function () {
@@ -9691,8 +10029,9 @@ function wire() {
   if (v.remote && v.remote.watchAvailability) v.remote.watchAvailability(function (a) { if (P && P.pb && P.pb.method === 'direct') els.b.cast.classList.toggle('hidden', !a); }).catch(function () { /* unsupported */ });
   root.addEventListener('mousemove', showUi);
   root.addEventListener('touchstart', function () { /* handled by gestures */ }, { passive: true });
-  document.addEventListener('fullscreenchange', updateButtons);
-  document.addEventListener('webkitfullscreenchange', updateButtons);
+  P.onFs = function () { updateButtons(); };
+  document.addEventListener('fullscreenchange', P.onFs);
+  document.addEventListener('webkitfullscreenchange', P.onFs);
   P.onVis = function () { if (document.hidden) report('hidden'); };
   P.onHide = function () { report('stopped'); if (P && P.pb && P.pb.sessionId && navigator.sendBeacon) navigator.sendBeacon('/api/v1/hls/' + P.pb.sessionId + '/stop', new Blob(['{}'], { type: 'text/plain' })); };
   document.addEventListener('visibilitychange', P.onVis);
@@ -9818,7 +10157,7 @@ function onKey(e, k) {
   }
   if (k === 'left' || k === 'right') {
     if (onCtl && LF.S.tv) { LF.Nav.move(k); return true; }
-    if (onCtl && !LF.S.tv && e.target.closest('.p-row')) return false;
+    if (onCtl && !LF.S.tv && ae.closest('.p-row')) return false;
     holdCount = e.repeat ? holdCount + 1 : 0;
     var step = LF.S.tv ? (holdCount > 20 ? 60 : holdCount > 8 ? 30 : 10) : 5;
     seekBy(k === 'left' ? -step : step);
@@ -9863,10 +10202,13 @@ function onTrick(d) { if (P && P.pb && d.id === P.id) api('/trickplay/' + P.id +
 function teardown(silent) {
   if (!P) return;
   var p = P;
-  report('stopped');
+  if (!p.ended) report('stopped');
   clearInterval(p.reportT); clearInterval(p.rafT); clearInterval(p.countdown); clearTimeout(p.idleT);
   document.removeEventListener('visibilitychange', p.onVis);
   window.removeEventListener('pagehide', p.onHide);
+  document.removeEventListener('fullscreenchange', p.onFs);
+  document.removeEventListener('webkitfullscreenchange', p.onFs);
+  try { if (p.video.remote && p.video.remote.cancelWatchAvailability) p.video.remote.cancelWatchAvailability().catch(function () { /* none */ }); } catch (e) { /* ignore */ }
   destroyHls();
   try { p.video.pause(); p.video.removeAttribute('src'); p.video.load(); } catch (e) { /* ignore */ }
   if (p.pb && p.pb.sessionId) api('/hls/' + p.pb.sessionId, { method: 'DELETE', keepalive: true }).catch(function () { /* gone */ });
@@ -9877,7 +10219,12 @@ function teardown(silent) {
   document.body.style.overflow = '';
   document.documentElement.style.overflow = '';
   document.title = (window.__LF__ && window.__LF__.name) || 'LocalFlix';
-  try { if ('mediaSession' in navigator) navigator.mediaSession.metadata = null; } catch (e) { /* ignore */ }
+  try {
+    if ('mediaSession' in navigator) {
+      navigator.mediaSession.metadata = null;
+      ['play', 'pause', 'seekbackward', 'seekforward', 'seekto', 'nexttrack', 'previoustrack'].forEach(function (a) { try { navigator.mediaSession.setActionHandler(a, null); } catch (e) { /* unsupported */ } });
+    }
+  } catch (e) { /* ignore */ }
   if (!silent && p.focusBefore && document.contains(p.focusBefore)) LF.Nav.focus(p.focusBefore);
   LF.refreshSoon();
 }
@@ -9886,7 +10233,7 @@ function close(fromRoute) {
   var focus = P.focusBefore;
   teardown(!!fromRoute);
   if (!fromRoute) {
-    if (LF.S.navCount > 0) history.back(); else LF.go(LF.S.page || 'home', true);
+    if (LF.canBack()) history.back(); else LF.go(LF.S.page || 'home', true);
     setTimeout(function () { if (focus && document.contains(focus)) LF.Nav.focus(focus); }, 60);
   }
 }

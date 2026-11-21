@@ -1,5 +1,35 @@
 # Changelog
 
+## 1.0.1 — 2026-11-21 (full code audit)
+
+### Security
+- DNS-rebinding guard: requests with an unknown `Host` header are rejected (421). Previously any website could get admin access when no password was set.
+- `Origin: null` counts as cross-origin. Admin elevation needs the dedicated admin PIN (it no longer falls back to the shared password). Changing the password signs out other sessions.
+- Without a selected profile the server never falls back to a PIN-protected profile. Kids profiles and disabled libraries no longer leak through series lists, search or item details. Library routes are admin-only.
+- Inputs: non-object JSON, bad `Content-Length` and NaN/Infinity numbers return 400 instead of 500 or corrupting stored state.
+
+### Streaming (M5)
+- Stopped encoders are killed hard, so truncated segments are never served after a seek or idle stop.
+- Simple HLS mode no longer freezes after ~78 s (throttling now follows the segments the player fetches).
+- Remux GOP numbering is correct for files whose video starts after the audio.
+- The transcode cap evicts only idle jobs (no more ping-pong between viewers) and also covers simple mode.
+- Segments deleted by cache cleanup are regenerated. HW→software fallback drops the HW output so init and segments match. 10-bit HEVC is only copied to clients that report `hevc10`.
+
+### Reliability
+- One SQLite connection per request thread is closed when the thread ends (it used to leak file descriptors).
+- Keyframe warm-up runs in a single bounded worker. Symlink loops are skipped. A full rescan no longer re-probes unchanged files. Purged items' thumbnails are removed. Trickplay runs on its own worker and isn't blocked while streaming.
+- Windows sleep prevention now holds for the whole stream. Termux releases its wake-lock on exit. A locked or unreadable database is no longer mistaken for corruption.
+- TLS handshakes moved off the accept loop. A full connection pool answers 503 instead of stalling. IPv6 bind (`--host ::`) works.
+
+### Parsing & subtitles
+- Episode titles no longer show release tags (`Show.S01E02.1080p` → "Episode 2"). Future-year numbers stay in the title ("Blade Runner 2049").
+- Shared `Subs/` folders only attach matching files. MicroDVD frame-rate headers and TTML tick/frame timestamps are supported.
+
+### Web UI & player
+- Password-protected servers show the login page (it used to be blank). Back no longer leaves the app (history depth is tracked). Grid cards size correctly. The profile-menu Settings link works.
+- TV: separate focus-outline rule for old engines, `clamp()` fallbacks for Chromium < 79, OK opens on release and long-press opens quick actions, extra scroller padding for focused cards, gamepad OK works.
+- Player: the resume position is kept while a stream loads. Auto-next no longer un-marks the episode as watched. Restart loops are capped. Overlapping negotiations don't orphan sessions. The next-episode countdown cancels when you seek back. "Sleep at end of episode" is respected. Listener and Media Session handler leaks are fixed. Pause survives quality and audio changes.
+
 ## 1.0.0 — 2026-11-21
 
 First release, built to the LocalFlix PRD (milestones M1–M8).
