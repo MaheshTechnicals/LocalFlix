@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.4.1 — 2026-11-24
+
+### Added
+- **Opening LocalFlix by IP switches to the DuckDNS address**, but only when the name works on that device. The page first loads a tiny image from the name, which proves the name resolves and its certificate is trusted there. If that fails, for example because the router blocks the name, the device stays on the IP. Path, `?tv=1` and the page hash are kept. You can turn this off under Settings → Network → *Domain redirect*.
+- **Plain `http://` on the HTTPS port no longer breaks.** Typing `192.168.0.103:8000` without `https://` used to fail once HTTPS was on. Now the server answers with a small page that moves to the DuckDNS name, or to `https://` on the same address. TLS is now set up per connection; the HTTPS behaviour itself is unchanged.
+- The banner's "this computer" link uses `https://` when HTTPS is on.
+- `install_acme` uses tarfile's safe `data` filter on Python 3.12+, so the deprecation warning is gone.
+
 ## 1.4.0 — 2026-11-24 (fixed address + free HTTPS)
 
 ### Added

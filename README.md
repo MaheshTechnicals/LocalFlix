@@ -208,7 +208,7 @@ Your router may give the server a different IP every day (`192.168.0.103` today,
    - proves you own the name through DuckDNS (a DNS check, so no open ports are needed);
    - gets a Let's Encrypt certificate and saves it for LocalFlix.
 
-   Restart LocalFlix and open `https://myflix.duckdns.org:8000`. You won't see a warning on any device. LocalFlix checks for renewal daily (certificates last 90 days) and loads the new certificate without a restart. Run `python3 localflix.py https --off` to go back to plain HTTP.
+   Restart LocalFlix and open `https://myflix.duckdns.org:8000`. You won't see a warning on any device. A device that opens LocalFlix by IP, including `192.168.0.x:8000` typed without `https://`, is moved to the name automatically if the name works on that device. You can turn this off with Settings → Network → *Domain redirect*. LocalFlix checks for renewal daily (certificates last 90 days) and loads the new certificate without a restart. Run `python3 localflix.py https --off` to go back to plain HTTP.
 
 Notes:
 - **What it needs:** `openssl` and `curl` (Termux/proot: `apt install openssl curl`). On Windows, run the `https` step inside WSL, or use any ACME client and set the certificate and key paths in Settings.

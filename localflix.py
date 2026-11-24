@@ -81,7 +81,7 @@ if sys.version_info < (3, 10):  # noqa: UP036  # pragma: no cover
 
 # ===== SECTION: constants =====
 APP_NAME = "LocalFlix"
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 SCHEMA_VERSION = 4
 HLSJS_VERSION = "1.7.4"  # resolved from the npm registry on 2026-11-21
 HLSJS_SHA384 = "p9vgU/7IYJWd3I4STrtqxqR/2cAQlhIX7D/HrTnIMEjjcUox165b7se7sxmm3zDg"
@@ -956,6 +956,9 @@ SETTINGS_SPEC: list[dict[str, Any]] = [
            "at this device's current Wi-Fi IP, so the address never changes", maxlen=80),
     S("duckdns_token", "", "secret", "network", admin=True, help="DuckDNS token (shown on duckdns.org after login)",
       maxlen=80),
+    S("domain_redirect", True, "bool", "network", admin=True,
+      help="When someone opens LocalFlix by IP address, switch to the DuckDNS address (only if it works on that "
+           "device; otherwise the IP keeps working)"),
     S("ssl_cert", "", "str", "network", admin=True, restart=True,
       help="HTTPS certificate path (set automatically by: python3 localflix.py https)", maxlen=500),
     S("ssl_key", "", "str", "network", admin=True, restart=True, help="HTTPS key path", maxlen=500),
@@ -5309,6 +5312,25 @@ def route(method: str, pattern: str, **flags: Any) -> Callable[[Callable[..., An
     return deco
 
 
+# Answer to plain http:// on the HTTPS port: try the DuckDNS name (an image probe proves the name resolves and its
+# certificate is trusted on this device), otherwise continue on https:// at the same address.
+PLAIN_REDIRECT_HTML = """<!doctype html><html><head><meta charset="utf-8"><title>LocalFlix</title>
+<meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="background:#0A0A0F;color:#aaa;font:16px sans-serif;text-align:center;padding-top:30vh">Opening LocalFlix …
+<script>(function () {
+  var d = __DOMAIN__, f = __FALLBACK__, p = location.pathname + location.search + location.hash, gone = false;
+  function go(u) { if (!gone) { gone = true; location.replace(u + p); } }
+  if (!d) { go(f); return; }
+  var i = new Image();
+  i.onload = function () { go(d); };
+  i.onerror = function () { go(f); };
+  setTimeout(function () { go(f); }, 3000);
+  i.src = d + '/static/favicon.svg?probe=' + new Date().getTime();
+})();</script>
+<noscript><p><a href="__FALLBACK_HREF__" style="color:#fff">Continue to LocalFlix</a></p></noscript></body></html>
+"""
+
+
 class Server(http.server.ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = not PLAT.is_windows
@@ -5327,6 +5349,28 @@ class Server(http.server.ThreadingHTTPServer):
                 self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)  # dual stack: IPv4 clients too
         super().server_bind()
 
+    def _plain_http_redirect(self, sock: socket.socket) -> None:
+        """Someone typed ``192.168.0.103:8000`` (http) while LocalFlix serves HTTPS: send them to the DuckDNS name if
+        it works from their device (checked in the browser), else to https:// on the same address."""
+        sock.settimeout(5)
+        data = b""
+        while b"\r\n\r\n" not in data and len(data) < 16384:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        head = data.split(b"\r\n\r\n", 1)[0].decode("latin-1", errors="replace").split("\r\n")
+        host = next((ln.split(":", 1)[1].strip() for ln in head[1:] if ln.lower().startswith("host:")), "")
+        if not re.fullmatch(r"[A-Za-z0-9.\-]+(:\d+)?|\[[0-9A-Fa-f:.%]+\](:\d+)?", host or "-"):
+            host = f"{(lan_ips() or ['localhost'])[0]}:{self.app.port}"
+        fallback = f"https://{host}"
+        domain = self.app.public_url() if self.app.setting("domain_redirect") else ""
+        page = PLAIN_REDIRECT_HTML.replace("__DOMAIN__", json.dumps(domain)).replace("__FALLBACK__", json.dumps(fallback))
+        page = page.replace("__FALLBACK_HREF__", html.escape(fallback + "/"))
+        body = page.encode("utf-8")
+        sock.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\n"
+                     b"Connection: close\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+
     def process_request(self, request: Any, client_address: Any) -> None:
         # never block the accept loop: when every slot is busy, answer 503 and close
         if not self.conn_sem.acquire(blocking=False):
@@ -5341,6 +5385,22 @@ class Server(http.server.ThreadingHTTPServer):
 
     def process_request_thread(self, request: Any, client_address: Any) -> None:
         try:
+            ctx = self.app.tls_ctx
+            if ctx is not None and not isinstance(request, ssl.SSLSocket):
+                # same port serves HTTPS and answers plain http:// with a redirect (a TLS hello starts with 0x16)
+                try:
+                    request.settimeout(10)
+                    first = request.recv(1, socket.MSG_PEEK)
+                except OSError:
+                    first = b""
+                if first != b"\x16":
+                    if first:
+                        with contextlib.suppress(OSError):
+                            self._plain_http_redirect(request)
+                    with contextlib.suppress(OSError):
+                        request.close()
+                    return
+                request = ctx.wrap_socket(request, server_side=True, do_handshake_on_connect=False)
             if isinstance(request, ssl.SSLSocket):  # TLS handshake off the accept loop
                 request.settimeout(30)
                 try:
@@ -5712,13 +5772,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         nonce = secrets.token_urlsafe(12)
         boot = {"version": VERSION, "tv": tv, "name": self.app.setting("server_name"),
                 "hlsjs": HLSJS_VERSION, "assets": self.app.asset_versions(), "authRequired": self.app.auth.required}
+        pub = self.app.public_url() if self.app.setting("domain_redirect") else ""
+        if pub:
+            boot["publicUrl"] = pub
         page = self._web_asset("index.html").decode("utf-8")
         page = page.replace("__NONCE__", nonce).replace("__BOOT__", json.dumps(boot).replace("</", "<\\/"))
         page = page.replace("__TV__", ' data-tv="1"' if tv else "").replace("__V_CSS__", boot["assets"]["css"])
         page = page.replace("__V_JS__", boot["assets"]["js"]).replace("__NAME__", html.escape(str(boot["name"])))
         csp = (f"default-src 'self'; script-src 'self' 'nonce-{nonce}'; style-src 'self' 'unsafe-inline'; "
-               "img-src 'self' data: blob:; media-src 'self' blob: data:; connect-src 'self'; worker-src 'self' blob:; "
-               "font-src 'self' data:; object-src 'none'; base-uri 'self'; frame-ancestors 'self'")
+               f"img-src 'self' data: blob:{' ' + pub if pub else ''}; media-src 'self' blob: data:; connect-src 'self'; "
+               "worker-src 'self' blob:; font-src 'self' data:; object-src 'none'; base-uri 'self'; frame-ancestors 'self'")
         self.send_bytes(page.encode("utf-8"), "text/html; charset=utf-8", cache="no-cache",
                         headers={"Content-Security-Policy": csp})
 
@@ -7214,7 +7277,8 @@ class App:
         assert self.httpd
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(cert, key)
-        self.httpd.socket = ctx.wrap_socket(self.httpd.socket, server_side=True, do_handshake_on_connect=False)
+        # connections are wrapped one by one (Server.process_request_thread): a browser that typed the address
+        # without https:// gets a redirect instead of a broken page
         self.tls = True
         self.tls_ctx = ctx
         self.tls_files = (cert, key, os.path.getmtime(cert))
@@ -7312,7 +7376,8 @@ def print_banner(app: App) -> None:
     print(c("  Open on any device on the same Wi-Fi:", "bold"))
     for i, u in enumerate(urls):
         print(f"    {c('➜', 'green')}  {c(u, 'cyan' if i == 0 else 'dim')}{c('   (best)', 'dim') if i == 0 and len(urls) > 1 else ''}")
-    print(f"    {c('➜', 'green')}  {c(f'http://localhost:{app.port}', 'dim')}  (this computer)")
+    local = f"{'https' if app.tls else 'http'}://localhost:{app.port}"
+    print(f"    {c('➜', 'green')}  {c(local, 'dim')}  (this computer)")
     if urls and app.setting("show_qr") and sys.stdout.isatty():
         with contextlib.suppress(Exception):
             qr = QRGEN.terminal(urls[0]).splitlines()
@@ -8410,7 +8475,10 @@ def install_acme(home: Path) -> Path | None:
                 for m in t.getmembers():  # never write outside the temp folder
                     if m.name.startswith("/") or ".." in Path(m.name).parts or m.issym() or m.islnk():
                         raise ValueError(f"unsafe path in archive: {m.name}")
-                t.extractall(td)  # members checked above
+                if hasattr(tarfile, "data_filter"):  # Python 3.12+: let tarfile enforce safe extraction too
+                    t.extractall(td, filter="data")
+                else:
+                    t.extractall(td)  # members checked above
         except (OSError, ValueError, tarfile.TarError) as e:
             print(c(f"  Download failed: {e}", "red"))
             return None
@@ -8798,7 +8866,16 @@ INDEX_HTML = r"""<!doctype html>
   <noscript><p>LocalFlix needs JavaScript enabled.</p></noscript></div>
 </div>
 <div id="toasts" aria-live="polite" aria-atomic="false"></div>
-<script nonce="__NONCE__">window.__LF__ = __BOOT__;</script>
+<script nonce="__NONCE__">window.__LF__ = __BOOT__;
+/* opened by IP address while a stable DuckDNS name exists: switch to it — but only if it works on this device
+   (an image from the name loads = DNS resolves + certificate trusted); otherwise stay on the IP */
+(function () {
+  var u = window.__LF__.publicUrl, hn = location.hostname;
+  if (!u || !/^(\d{1,3}(\.\d{1,3}){3}|\[[0-9a-f:.%]+\])$/i.test(hn) || /^127\./.test(hn) || hn === '[::1]') return;
+  var i = new Image(), t = setTimeout(function () { i.onload = null; }, 3000);
+  i.onload = function () { clearTimeout(t); location.replace(u + location.pathname + location.search + location.hash); };
+  i.src = u + '/static/favicon.svg?probe=' + new Date().getTime();
+})();</script>
 <script src="/static/app.js?v=__V_JS__" defer></script>
 </body>
 </html>
