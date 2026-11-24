@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.2.1 — 2026-11-24 (phone polish & faster start)
+
+### Fixed
+- **Black strip on the right of phone screens:** a long folder path overflowed the page, so Android zoomed the whole page out. Long text now wraps everywhere, and the page can never be wider than the screen.
+- **Cropped "My List" / "Mark watched" labels and oversized text:** a phone that had once opened the `/tv` link stayed in TV mode. Touch phones and tablets now ignore the remembered TV flag (unless TV mode is set to "On"), and the labels always fit.
+- **Fullscreen lost on the next episode:** fullscreen is now held on the page rather than the player element, so auto-next and the "Next episode" button continue in fullscreen and landscape. Leaving the player still exits fullscreen.
+- **Player menus:** sub-menus opened from ⚙ (Speed, Quality, Chapters) have a "‹ Back" row. A tap anywhere outside an open menu closes it without pausing or toggling the controls.
+
+### Faster start & resume
+- Encoders start at the resume position as soon as Play is pressed. The player no longer launches a throw-away ffmpeg at 0:00 before the real one.
+- Transcodes use 3-second segments, so the first picture needs ~3 s of encoding instead of 6 s. Measured transcode resume: 4.0 s → 1.2 s on the test machine.
+- Opening a details page (or a series' "up next" episode) builds that file's keyframe table right away, and the next episode is prepared while you watch. If a table still isn't ready, playback starts after at most 2.5 s instead of 8 s, and simple mode answers after one segment instead of three.
+- The player script (hls.js) is pre-loaded when a details page opens. The first fragment is prefetched.
+
 ## 1.2.0 — 2026-11-22 (mobile & details redesign)
 
 ### Fixed

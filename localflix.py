@@ -80,7 +80,7 @@ if sys.version_info < (3, 10):  # noqa: UP036  # pragma: no cover
 
 # ===== SECTION: constants =====
 APP_NAME = "LocalFlix"
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 SCHEMA_VERSION = 4
 HLSJS_VERSION = "1.7.4"  # resolved from the npm registry on 2026-11-21
 HLSJS_SHA384 = "p9vgU/7IYJWd3I4STrtqxqR/2cAQlhIX7D/HrTnIMEjjcUox165b7se7sxmm3zDg"
@@ -2137,8 +2137,9 @@ class Scanner:
         self._qlock = threading.Lock()
         self._threads: list[threading.Thread] = []
         self._kf_running: set[str] = set()
-        self._kf_q: queue.Queue[tuple[str, Path, Path]] = queue.Queue()
+        self._kf_q: queue.PriorityQueue[tuple[int, float, str, Path, Path]] = queue.PriorityQueue()
         self._kf_thread: threading.Thread | None = None
+        self._kf_prio: dict[str, int] = {}
         self._manual = False
 
     def start(self) -> None:
@@ -2582,8 +2583,8 @@ class Scanner:
             if self.app.ff.available and info.get("video") and info["container"] not in ("mp4", "mov", "webm"):
                 self.warm_keyframes(iid, path)
 
-    def warm_keyframes(self, iid: str, path: Path) -> None:
-        """Queue a background keyframe-table build (one low-priority ffprobe at a time)."""
+    def warm_keyframes(self, iid: str, path: Path, prio: int = 5) -> None:
+        """Queue a keyframe-table build (one ffprobe at a time). prio 0 = the user is about to play it."""
         try:
             st = path.stat()
         except OSError:
@@ -2592,23 +2593,45 @@ class Scanner:
         if cache.exists():
             return
         with self._qlock:
-            if iid in self._kf_running:
+            cur = self._kf_prio.get(iid)
+            if cur is not None and cur <= prio:
                 return
+            self._kf_prio[iid] = prio
             self._kf_running.add(iid)
             if self._kf_thread is None:
                 self._kf_thread = threading.Thread(target=self._kf_loop, name="keyframes", daemon=True)
                 self._kf_thread.start()
-        self._kf_q.put((iid, path, cache))
+        if prio == 0:  # the user is waiting: don't queue behind a long background scan
+            threading.Thread(target=self._kf_one, args=(iid, path, cache), name="keyframes-now", daemon=True).start()
+            return
+        self._kf_q.put((prio, time.time(), iid, path, cache))
+
+    def _kf_one(self, iid: str, path: Path, cache: Path) -> None:
+        try:
+            if not cache.exists():
+                keyframe_table(self.app.ff, path, cache)
+        except Exception as e:  # noqa: BLE001
+            log.debug("keyframe build %s failed: %s", iid, e)
+        finally:
+            with self._qlock:
+                self._kf_running.discard(iid)
+                self._kf_prio.pop(iid, None)
 
     def _kf_loop(self) -> None:
         while not self._stop.is_set():
             try:
-                iid, path, cache = self._kf_q.get(timeout=5)
+                prio, ts, iid, path, cache = self._kf_q.get(timeout=5)
             except queue.Empty:
                 continue
-            while (self.app.setting("pause_bg_while_streaming") and self.app.hls.active_streams() > 0
-                   and not self._stop.is_set()):
-                time.sleep(2)
+            if cache.exists():
+                with self._qlock:
+                    self._kf_running.discard(iid)
+                    self._kf_prio.pop(iid, None)
+                continue
+            if prio > 1 and self.app.setting("pause_bg_while_streaming") and self.app.hls.active_streams() > 0:
+                self._kf_q.put((prio, ts, iid, path, cache))  # background work waits; user-requested work doesn't
+                self._stop.wait(2)
+                continue
             try:
                 if not cache.exists():
                     keyframe_table(self.app.ff, path, cache)
@@ -2617,6 +2640,7 @@ class Scanner:
             finally:
                 with self._qlock:
                     self._kf_running.discard(iid)
+                    self._kf_prio.pop(iid, None)
 
 
 # ===== SECTION: artwork =====
@@ -3672,6 +3696,7 @@ def audio_codec_string(codec: str, mode: str) -> str:
 
 # ===== SECTION: hls-engine =====
 SEG_LEN = 6.0
+TRANSCODE_SEG = 3.0  # shorter video segments when encoding: faster start & seeks on slow CPUs
 
 
 def build_fixed_segments(duration: float, seg: float = SEG_LEN) -> list[tuple[float, float]]:
@@ -3870,6 +3895,7 @@ class HlsSession:
         self.mode = mode
         self.fmp4 = manager.app.setting("segment_format") != "ts"
         self.start_time = start_time if mode == "simple" else 0.0
+        self.start_hint = max(0.0, start_time)
         self.dir = manager.app.paths.hls / self.id
         self.dir.mkdir(parents=True, exist_ok=True)
         self.created = time.time()
@@ -3909,7 +3935,7 @@ class HlsSession:
             gaps = [b - a for a, b in zip(self.gops, self.gops[1:]) if b - a > 0.0005]
             self.gop_time = max(0.005, min(0.5, (min(gaps) if gaps else 1.0) * 0.5))
         elif self.video_mode == "transcode":
-            self.vsegs = build_fixed_segments(self.duration)
+            self.vsegs = build_fixed_segments(self.duration, TRANSCODE_SEG)
 
     # --- playlists ----------------------------------------------------------
     def master(self, text_subs: list[dict[str, Any]]) -> str:
@@ -4042,9 +4068,9 @@ class HlsSession:
                 enc = ["-c:v", "libopenh264", "-b:v", f"{kbps}k"] if "libopenh264" in app.ff.encoders else \
                     ["-c:v", "mpeg4", "-q:v", "4"]
         filters.append(fmt)
-        enc += ["-force_key_frames", f"expr:gte(t,n_forced*{SEG_LEN:g})", "-sc_threshold", "0"]
+        enc += ["-force_key_frames", f"expr:gte(t,n_forced*{TRANSCODE_SEG:g})", "-sc_threshold", "0"]
         if not hw or hw in ("nvenc", "qsv", "amf"):
-            enc += ["-g", str(int((v.get("fps") or 25) * SEG_LEN))]
+            enc += ["-g", str(int((v.get("fps") or 25) * TRANSCODE_SEG))]
         return pre, ",".join(filters), enc
 
     def video_args(self, seg: int, sw: bool = False) -> tuple[list[str], Callable[[int], Path], int, str]:
@@ -4078,7 +4104,7 @@ class HlsSession:
             args += ["-map", "0:v:0", "-vf", vf]
         args += ["-an", "-sn", "-dn"] + enc
         args += ["-avoid_negative_ts", "make_non_negative", "-output_ts_offset", f"{t:.6f}", "-max_muxing_queue_size", "4096"]
-        args += self._hls_out(outdir, "seg", seg, SEG_LEN, f"init_{seg}{'sw' if sw else ''}.mp4")
+        args += self._hls_out(outdir, "seg", seg, TRANSCODE_SEG, f"init_{seg}{'sw' if sw else ''}.mp4")
         return args, lambda n: outdir / f"seg_{n:06d}.m4s", seg, "video"
 
     def audio_args(self, k: int, seg: int) -> tuple[list[str], Callable[[int], Path], int, str]:
@@ -4144,7 +4170,8 @@ class HlsSession:
             else:
                 args += ["-c:a", "aac", "-b:a", "192k", "-ac", "2", "-af", "aresample=async=1:first_pts=0"]
         args += ["-sn", "-dn", "-avoid_negative_ts", "make_zero", "-max_muxing_queue_size", "4096",
-                 "-f", "hls", "-hls_time", f"{SEG_LEN:g}", "-hls_playlist_type", "event", "-hls_list_size", "0",
+                 "-f", "hls", "-hls_time", f"{TRANSCODE_SEG if self.video_mode == 'transcode' else SEG_LEN:g}",
+                 "-hls_playlist_type", "event", "-hls_list_size", "0",
                  "-hls_flags", "+independent_segments+temp_file"]
         if self.fmp4:
             args += ["-hls_segment_type", "fmp4", "-hls_fmp4_init_filename", "s_init.mp4",
@@ -4262,6 +4289,29 @@ class HlsSession:
                 return None
             time.sleep(0.05)
 
+    def seg_at(self, rendition: str, t: float) -> int:
+        """Index of the public segment containing time ``t`` for a rendition."""
+        table = self.vsegs if rendition == "video" else self.asegs
+        for i, (a, d) in enumerate(table):
+            if a <= t < a + d:
+                return i
+        return max(0, len(table) - 1) if table and t > 0 else 0
+
+    def prestart(self) -> None:
+        """Start the video + selected-audio encoders at the start position right away (saves 1–2 round trips
+        and avoids a throw-away ffmpeg that the init request used to start at 0:00)."""
+        if self.mode == "simple":
+            with contextlib.suppress(TranscodeBusy, OSError, FileNotFoundError):
+                self.ensure_simple()
+            return
+        rends = (["video"] if self.video_mode else []) + \
+            ([f"audio_{self.decision.get('audioIndex') or 0}"] if self.audio else [])
+        with self.lock:
+            for r in rends:
+                if r not in self.jobs:
+                    with contextlib.suppress(TranscodeBusy, OSError, IndexError):
+                        self._restart(r, self.seg_at(r, self.start_hint))
+
     def init_file(self, rendition: str) -> Path | None:
         d = self.dir / ("video" if rendition == "video" else rendition)
         for _ in range(400):
@@ -4278,7 +4328,7 @@ class HlsSession:
             # kick a job so the init segment gets written
             with self.lock:
                 if rendition not in self.jobs:
-                    self._restart(rendition, 0)
+                    self._restart(rendition, self.seg_at(rendition, self.start_hint))
             time.sleep(0.05)
         return None
 
@@ -4358,16 +4408,17 @@ class HlsManager:
         if mode == "ondemand" and decision.get("videoMode") == "copy":
             st = path.stat()
             cache = self.app.paths.keyframes / f"{stable_id(item_id, st.st_size, st.st_mtime_ns)}.json"
-            result: dict[str, Any] = {}
-
-            def work() -> None:
-                result["k"] = keyframe_table(self.app.ff, path, cache)
-            th = threading.Thread(target=work, daemon=True)
-            th.start()
-            th.join(timeout=8.0)
-            kfs = result.get("k")
+            if not cache.exists():
+                # usually built already (details page / background warm-up); otherwise give it a moment, then start
+                # instantly in simple mode while the table finishes for the next play / seek-heavy session
+                self.app.scanner.warm_keyframes(item_id, path, prio=0)
+                deadline = time.time() + 2.5
+                while not cache.exists() and time.time() < deadline:
+                    time.sleep(0.05)
+            if cache.exists():
+                kfs = keyframe_table(self.app.ff, path, cache)
             if not kfs:
-                log.info("Keyframe table not ready for %s — using simple HLS mode for this session", item_id)
+                log.info("Keyframe table not ready for %s — starting in simple HLS mode", item_id)
                 mode = "simple"
         if replace:
             self.stop_session(replace)
@@ -5608,11 +5659,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                                "ORDER BY folder LIMIT 100")]
         self.send_json({"genres": [g for g, _ in counts.most_common()], "folders": folders})
 
+    def _warm_item(self, iid: str | None, prio: int) -> None:
+        """Opening a details page means play is likely: build its keyframe table now (remux needs it)."""
+        if not iid or not self.app.ff.available:
+            return
+        r = self.app.db.one("SELECT i.rel_path, i.container, l.path AS lib FROM items i JOIN libraries l "
+                            "ON l.id=i.library_id WHERE i.id=?", (iid,))
+        if r is None or (r["container"] or "") in ("mp4", "mov", "webm"):
+            return
+        p = safe_join(Path(r["lib"]), r["rel_path"])
+        if p is not None:
+            self.app.scanner.warm_keyframes(iid, p, prio=prio)
+
     @route("GET", r"/api/v1/items/([0-9a-f]{16})")
     def h_item(self, iid: str) -> None:
         d = self.app.library.details(self.profile(), iid)
         if d is None:
             raise HTTPError(404, "not_found", "Item not found")
+        self._warm_item(iid, 0)
         self.send_json(d)
 
     @route("GET", r"/api/v1/series/([0-9a-f]{16})")
@@ -5620,6 +5684,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         d = self.app.library.series(self.profile(), sid)
         if d is None:
             raise HTTPError(404, "not_found", "Series not found")
+        self._warm_item((d.get("nextUp") or {}).get("id"), 0)
         self.send_json(d)
 
     @route("GET", r"/api/v1/series/([0-9a-f]{16})/seasons/(\d+)")
@@ -5685,6 +5750,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             app.hls.touch_direct(iid)
         else:
             sess = app.hls.create(iid, path, info, dec, start, replace=caps.get("replaceSession"))
+            sess.prestart()
             resp.update({"sessionId": sess.id, "url": f"/api/v1/hls/{iid}/{sess.id}/master.m3u8", "mode": sess.mode,
                          "timeOffset": sess.start_time, "videoMode": sess.video_mode,
                          "hw": None if sess.video_mode != "transcode" or sess.sw_fallback else sess.hw})
@@ -5709,6 +5775,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         prv = lib.prev_episode(r2) if r2 else None
         resp["item"] = lib.cards([r2], prof["id"])[0] if r2 else None
         resp["next"] = lib.cards([nxt], prof["id"])[0] if nxt else None
+        if nxt:
+            self._warm_item(nxt["id"], 1)  # next episode starts instantly too
         resp["prevId"] = prv["id"] if prv else None
         log.info("Playback %s: %s (%s)", row["rel_path"], dec["method"], ",".join(dec["reason"]))
         self.send_json(resp)
@@ -5753,7 +5821,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     p = outdir / "stream.m3u8"
                     if p.exists():
                         txt = p.read_text(errors="ignore")
-                        if txt.count("#EXTINF") >= 3 or "#EXT-X-ENDLIST" in txt:
+                        if txt.count("#EXTINF") >= 1 or "#EXT-X-ENDLIST" in txt:
                             return self.send_bytes(txt.encode(), m3u8)
                     if job.finished and job.returncode not in (0, None):
                         if s.video_mode == "transcode" and s.hw and not s.sw_fallback:
@@ -7531,7 +7599,7 @@ class TestServerAPI(unittest.TestCase):
         self.assertIsNotNone(m)
         ver = init[m.end()]
         ts = struct.unpack(">I", init[m.end() + (20 if ver == 1 else 12): m.end() + (24 if ver == 1 else 16)])[0]
-        self.assertAlmostEqual(tf[0] / ts, 6.0, delta=0.15)
+        self.assertAlmostEqual(tf[0] / ts, TRANSCODE_SEG, delta=0.15)
         self.req(f"/api/v1/hls/{pb['sessionId']}", "DELETE")
 
     def test_06_subtitles(self) -> None:
@@ -8039,7 +8107,8 @@ html[data-cards="l"]{--card-w:24vw}
 }
 *{box-sizing:border-box}
 html{font-size:calc(var(--fs-base) * var(--scale));-webkit-text-size-adjust:100%;text-size-adjust:100%;background:var(--bg)}
-body{margin:0;background:var(--bg);color:var(--text);font-family:var(--font);line-height:1.45;-webkit-font-smoothing:antialiased;overflow-x:hidden;min-height:100vh}
+html{overflow-x:hidden;max-width:100%}
+body{margin:0;background:var(--bg);color:var(--text);font-family:var(--font);line-height:1.45;-webkit-font-smoothing:antialiased;overflow-x:hidden;min-height:100vh;max-width:100%}
 a{color:inherit;text-decoration:none}
 button,input,select,textarea{font:inherit;color:inherit}
 button{cursor:pointer;border:0;background:none;padding:0}
@@ -8410,6 +8479,7 @@ select.input{padding-right:2em}
 .p-menu button:hover,.p-menu button:focus{background:rgba(255,255,255,.1)}
 .p-menu button .ck{width:1.4em;flex:none;color:var(--accent)}
 .p-menu button small{margin-left:auto;padding-left:1em;color:rgba(255,255,255,.55);font-size:.8rem}
+.p-menu .p-back{font-weight:700;border-bottom:1px solid rgba(255,255,255,.12);border-radius:8px 8px 0 0;margin-bottom:4px}
 .p-menu .eps button{align-items:flex-start}
 .skipbtn{position:absolute;right:3vw;bottom:130px;z-index:6;background:rgba(255,255,255,.92);color:#111;font-weight:750;padding:.75em 1.3em;border-radius:8px;display:flex;align-items:center;box-shadow:var(--shadow)}
 .skipbtn .ico{margin-left:.4em}
@@ -8575,6 +8645,25 @@ html[data-tv]{--fs-base:22px}
   .who h1{font-size:1.6rem}
   .modal.sm{padding:1.2em}
   .toolbar select,.chip{font-size:.85rem}
+}
+
+
+/* ---------- overflow & small-screen fixes (v1.2.1) ---------- */
+.set,.set-main,.page,.card-box,.field,.field .lbl,.lib,.lib .grow,.dp,.dp-body,.dp-head{min-width:0;max-width:100%}
+.lib .grow,.lib .grow *,.field .lbl small,.dp-tech,.empty code,.banner code{overflow-wrap:anywhere;word-break:break-word}
+@media (max-width:768px){
+  .set-main{padding-left:var(--pad);padding-right:var(--pad);width:100%}
+  .lib{display:flex;flex-wrap:wrap;align-items:center}
+  .lib .grow{flex:1 1 calc(100% - 2.4em)}
+  .lib select.input{flex:0 1 auto;max-width:50%;margin-left:2.1em}
+  .lib .toggle{margin:0 .4em 0 auto}
+  .lib .btn-icon{margin-left:.2em!important}
+}
+/* round action buttons on phones always show their label in full (TV sizing must not win here) */
+@media (max-width:768px),(max-height:500px) and (pointer:coarse){
+  html[data-tv] .dp-round,.dp-round{width:auto;height:auto;min-width:4.5em}
+  .dp-round-l{overflow:visible;white-space:nowrap;line-height:1.3}
+  .dp-rounds{width:100%}
 }
 
 /* TV (10-foot) */
@@ -8876,8 +8965,10 @@ function applySettings() {
   root.setAttribute('data-cards', v.card_size || 'm');
   root.setAttribute('data-motion', v.reduce_motion ? 'reduce' : 'full');
   var tvPref = v.tv_mode || 'auto', urlTv = /[?&]tv=1/.test(location.search) || location.hash.indexOf('#/tv') === 0;
-  if (urlTv) store('tv', true);
-  S.tv = tvPref === 'on' || (tvPref === 'auto' && (!!BOOT.tv || urlTv || store('tv') === true));
+  var handheld = /Mobi|iPhone|iPad|Android(?!.*(TV|AFT))/i.test(navigator.userAgent) && !BOOT.tv &&
+    window.matchMedia && matchMedia('(pointer:coarse)').matches;
+  if (handheld) store('tv', null); else if (urlTv) store('tv', true);
+  S.tv = tvPref === 'on' || (tvPref === 'auto' && !handheld && (!!BOOT.tv || urlTv || store('tv') === true));
   if (tvPref === 'off') { S.tv = false; store('tv', false); }
   if (S.tv) { root.setAttribute('data-tv', '1'); root.setAttribute('data-lite', '1'); } else { root.removeAttribute('data-tv'); root.removeAttribute('data-lite'); }
   var scale = (v.ui_scale || 100) / 100; root.style.setProperty('--scale', scale);
@@ -9596,6 +9687,7 @@ function aboutSection(title, rows, tech) {
     tech ? h('p.dp-tech', tech) : null);
 }
 function openDetails(id) {
+  if (LF.Player && LF.Player.preload) LF.Player.preload();
   var sh = dpShell('', '');
   sh.head.appendChild(h('div.skel', { style: { height: '2.4em', width: '60%', borderRadius: '8px' } }));
   routeModal(sh.root, { cls: 'dp-modal' });
@@ -9653,6 +9745,7 @@ function episodeRow(e, compact) {
       e.overview ? h('div.dp-ep-o', e.overview) : null));
 }
 function openSeries(id) {
+  if (LF.Player && LF.Player.preload) LF.Player.preload();
   var sh = dpShell('', '');
   sh.head.appendChild(h('div.skel', { style: { height: '2.4em', width: '60%', borderRadius: '8px' } }));
   routeModal(sh.root, { cls: 'dp-modal' });
@@ -10283,9 +10376,10 @@ function build(id) {
   return { root: root, video: video, subs: subs, bright: bright, gest: gest, center: center, title: title, ui: ui, seek: seek, trk: trk, preview: preview, time: time, volIn: volIn, b: b, row: row };
 }
 
+function preload() { if (window.MediaSource || window.ManagedMediaSource) loadHls(); }
 function open(id, q) {
   if (P && P.id === id && !(q && q.t !== undefined)) return;
-  if (P) teardown(true);
+  if (P) teardown(true, true);  /* next/previous episode: keep fullscreen + orientation */
   q = q || {};
   var els = build(id);
   P = { id: id, els: els, video: els.video, root: els.root, offset: 0, pb: null, hls: null, cues: [], subIndex: null, audioIndex: null, quality: null,
@@ -10385,7 +10479,7 @@ function load(pb, start) {
     var preferNative = nativeHls && !(Hls && Hls.isSupported()) || (nativeHls && /iPhone|iPad|iPod/.test(navigator.userAgent) && !window.ManagedMediaSource);
     if (Hls && Hls.isSupported() && !preferNative) {
       var hls = new Hls({
-        enableWorker: true, backBufferLength: 30, maxBufferLength: 40, maxMaxBufferLength: 90, startPosition: localStart,
+        enableWorker: true, startFragPrefetch: true, backBufferLength: 30, maxBufferLength: 40, maxMaxBufferLength: 90, startPosition: localStart,
         capLevelToPlayerSize: false, abrEwmaDefaultEstimate: 5e6, preferManagedMediaSource: true, enableWebVTT: false, enableIMSC1: false,
         enableCEA708Captions: false, renderTextTracksNatively: false, fragLoadPolicy: { default: { maxTimeToFirstByteMs: 25000, maxLoadTimeMs: 60000,
           timeoutRetry: { maxNumRetry: 4, retryDelayMs: 0, maxRetryDelayMs: 0 }, errorRetry: { maxNumRetry: 6, retryDelayMs: 800, maxRetryDelayMs: 4000 } } },
@@ -10546,7 +10640,7 @@ function osd(text) {
 }
 function saveVol() { if (settings().remember_volume !== false) store('vol', { v: P.video.volume, m: P.video.muted }); updateButtons(); }
 function toggleFs() {
-  var d = document, el = P.root;
+  var d = document, el = document.documentElement;  /* the player is a fixed full-viewport layer: it fills the screen */
   var fsEl = d.fullscreenElement || d.webkitFullscreenElement;
   if (fsEl) { (d.exitFullscreen || d.webkitExitFullscreen).call(d); return; }
   var req = el.requestFullscreen || el.webkitRequestFullscreen;
@@ -10758,11 +10852,13 @@ function renderStats() {
 }
 
 /* --- menus --- */
-function menu(kind) {
+function menu(kind, fromSettings) {
   if (!P || !P.pb) return;
   if (P.menu) { var same = P.menu.kind === kind; P.menuClose(); if (same) return; }
   var pb = P.pb, items = [], m = h('div.p-menu', { role: 'menu' });
   function opt(label, on, fn, small) { return h('button', { role: 'menuitemradio', 'aria-checked': on ? 'true' : 'false', onclick: function (e) { e.stopPropagation(); fn(); } }, h('span.ck', on ? '✓' : ''), label, small ? h('small', small) : null); }
+  if (fromSettings) items.push(h('button.p-back', { onclick: function (e) { e.stopPropagation(); P.menuClose(); menu('settings'); } },
+    h('span.ck', '‹'), t('b.back')));
   if (kind === 'audio') {
     items.push(h('h4', t('p.audio')));
     pb.audio.forEach(function (a) { items.push(opt(a.label, a.index === P.audioIndex, function () { setAudio(a.index); })); });
@@ -10805,9 +10901,9 @@ function menu(kind) {
     var pbm = P.pb || {};
     items.push(h('div.p-menu-more',
       h('h4', t('p.more')),
-      opt(t('p.speed'), false, function () { P.menuClose(); menu('speed'); }, P.video.playbackRate === 1 ? t('p.normal') : P.video.playbackRate + '×'),
-      opt(t('p.quality'), false, function () { P.menuClose(); menu('quality'); }, P.quality || settings().max_quality || 'auto'),
-      pbm.chapters && pbm.chapters.length > 1 ? opt(t('p.chapters'), false, function () { P.menuClose(); menu('chapters'); }) : null,
+      opt(t('p.speed'), false, function () { P.menuClose(); menu('speed', true); }, P.video.playbackRate === 1 ? t('p.normal') : P.video.playbackRate + '×'),
+      opt(t('p.quality'), false, function () { P.menuClose(); menu('quality', true); }, P.quality || settings().max_quality || 'auto'),
+      pbm.chapters && pbm.chapters.length > 1 ? opt(t('p.chapters'), false, function () { P.menuClose(); menu('chapters', true); }) : null,
       pbm.next ? opt(t('p.next'), false, function () { P.menuClose(); playNext(); }, t('meta.ep', pbm.next.season, pbm.next.episode)) : null,
       document.pictureInPictureEnabled && !P.video.disablePictureInPicture ? opt('Picture in picture', false, function () { P.menuClose(); togglePip(); }) : null));
     items.push(h('h4', t('p.fit')));
@@ -10899,6 +10995,14 @@ function wire() {
   if (window.WebKitPlaybackTargetAvailabilityEvent) v.addEventListener('webkitplaybacktargetavailabilitychanged', function (e) { els.b.air.classList.toggle('hidden', e.availability !== 'available'); });
   if (v.remote && v.remote.watchAvailability) v.remote.watchAvailability(function (a) { if (P && P.pb && P.pb.method === 'direct') els.b.cast.classList.toggle('hidden', !a); }).catch(function () { /* unsupported */ });
   root.addEventListener('mousemove', showUi);
+  P.onOutside = function (e) {
+    if (!P || !P.menu) return;
+    var tg = e.target;
+    if (tg.closest && (tg.closest('.p-menu') || tg.closest('.p-btn'))) return;  /* buttons toggle/switch menus themselves */
+    P.menuClose();
+    P.swallowTap = Date.now();
+  };
+  root.addEventListener('pointerdown', P.onOutside, true);
   root.addEventListener('touchstart', function () { /* handled by gestures */ }, { passive: true });
   P.onFs = function () { updateButtons(); };
   document.addEventListener('fullscreenchange', P.onFs);
@@ -10927,6 +11031,7 @@ function wire() {
   // gestures on the video surface
   var g = els.gest, lastTap = 0, tapT = null, start = null, longT = null, acc = 0, accT = null;
   g.addEventListener('click', function (e) {
+    if (Date.now() - (P.swallowTap || 0) < 600) return;
     if (P.touchHandled) { P.touchHandled = false; return; }
     if (P.menu) { P.menuClose(); return; }
     clearTimeout(tapT);
@@ -10966,6 +11071,7 @@ function wire() {
   }, { passive: true });
   g.addEventListener('touchend', function (e) {
     clearTimeout(longT);
+    if (Date.now() - (P.swallowTap || 0) < 600) { start = null; P.touchHandled = true; return; }
     if (P.speedHold !== null && P.speedHold !== undefined) { v.playbackRate = P.speedHold; P.speedHold = null; P.touchHandled = true; return; }
     if (!start) return;
     var s = start; start = null;
@@ -11082,7 +11188,7 @@ function onJob(d) {
 }
 function onTrick(d) { if (P && P.pb && d.id === P.id) api('/trickplay/' + P.id + '/index.json').then(function (ti) { ti.url = '/api/v1/trickplay/' + P.id + '/'; P.pb.trickplay = ti; }).catch(function () { /* not ready */ }); }
 
-function teardown(silent) {
+function teardown(silent, keepFs) {
   if (!P) return;
   var p = P;
   if (!p.ended) report('stopped');
@@ -11095,7 +11201,10 @@ function teardown(silent) {
   destroyHls();
   try { p.video.pause(); p.video.removeAttribute('src'); p.video.load(); } catch (e) { /* ignore */ }
   if (p.pb && p.pb.sessionId) api('/hls/' + p.pb.sessionId, { method: 'DELETE', keepalive: true }).catch(function () { /* gone */ });
-  if (document.fullscreenElement || document.webkitFullscreenElement) { try { (document.exitFullscreen || document.webkitExitFullscreen).call(document); } catch (e) { /* ignore */ } }
+  if (!keepFs && (document.fullscreenElement || document.webkitFullscreenElement)) {
+    try { (document.exitFullscreen || document.webkitExitFullscreen).call(document); } catch (e) { /* ignore */ }
+    try { if (screen.orientation && screen.orientation.unlock) screen.orientation.unlock(); } catch (e) { /* ignore */ }
+  }
   if (document.pictureInPictureElement) { try { document.exitPictureInPicture(); } catch (e) { /* ignore */ } }
   p.root.remove();
   P = null;
@@ -11120,7 +11229,7 @@ function close(fromRoute) {
     setTimeout(function () { if (focus && document.contains(focus)) LF.Nav.focus(focus); }, 60);
   }
 }
-LF.Player = { open: open, close: close, active: function () { return !!P; }, onKey: onKey, onJob: onJob, onTrick: onTrick, parseVTT: parseVTT, debug: function () { return P ? { pos: pos(), dur: dur(), cues: P.cues.length, subIndex: P.subIndex, audioIndex: P.audioIndex, offset: P.offset, pb: P.pb } : null; } };
+LF.Player = { preload: preload, open: open, close: close, active: function () { return !!P; }, onKey: onKey, onJob: onJob, onTrick: onTrick, parseVTT: parseVTT, debug: function () { return P ? { pos: pos(), dur: dur(), cues: P.cues.length, subIndex: P.subIndex, audioIndex: P.audioIndex, offset: P.offset, pb: P.pb } : null; } };
 })();
 
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', LF.ready); else LF.ready();
