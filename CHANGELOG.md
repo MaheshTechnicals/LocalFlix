@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.2.3 — 2026-11-24
+
+### Fixed
+- **Player controls flashed and vanished on tap (normal and fullscreen):** phones fire a synthetic `mousemove` right after every tap. It showed the controls, then the tap handler saw them visible and hid them again. That event is now ignored after a touch, and a tap decides show/hide from how the controls looked when the finger touched. A tap shows them instantly; they stay for 4 s (3 s with a mouse); another tap hides them. Double-tap seek is unchanged.
+
 ## 1.2.2 — 2026-11-24 (playback hangs, TV remote, browser launch)
 
 ### Fixed — videos stuck at "Preparing stream… 99 %"

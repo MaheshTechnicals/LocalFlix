@@ -80,7 +80,7 @@ if sys.version_info < (3, 10):  # noqa: UP036  # pragma: no cover
 
 # ===== SECTION: constants =====
 APP_NAME = "LocalFlix"
-VERSION = "1.2.2"
+VERSION = "1.2.3"
 SCHEMA_VERSION = 4
 HLSJS_VERSION = "1.7.4"  # resolved from the npm registry on 2026-11-21
 HLSJS_SHA384 = "p9vgU/7IYJWd3I4STrtqxqR/2cAQlhIX7D/HrTnIMEjjcUox165b7se7sxmm3zDg"
@@ -10834,7 +10834,7 @@ function showUi() {
       P.root.classList.add('idle');
       if (P.root.contains(document.activeElement) && document.activeElement !== P.video) { try { document.activeElement.blur(); } catch (e) { /* ignore */ } }
     }
-  }, 3000);
+  }, Date.now() - (P.lastTouch || 0) < 1500 ? 4000 : 3000);  /* a little longer after a tap on touch screens */
 }
 function uiVisible() { return P && !P.root.classList.contains('idle'); }
 function tick() {
@@ -11113,7 +11113,8 @@ function wire() {
   P.rafT = setInterval(function () { if (P && !P.video.paused && P.cues.length) renderSubs(false); }, 200);
   if (window.WebKitPlaybackTargetAvailabilityEvent) v.addEventListener('webkitplaybacktargetavailabilitychanged', function (e) { els.b.air.classList.toggle('hidden', e.availability !== 'available'); });
   if (v.remote && v.remote.watchAvailability) v.remote.watchAvailability(function (a) { if (P && P.pb && P.pb.method === 'direct') els.b.cast.classList.toggle('hidden', !a); }).catch(function () { /* unsupported */ });
-  root.addEventListener('mousemove', showUi);
+  /* phones fire a synthetic mousemove right after every tap: ignore it, the tap handler decides */
+  root.addEventListener('mousemove', function () { if (Date.now() - (P.lastTouch || 0) > 1000) showUi(); });
   P.onOutside = function (e) {
     if (!P || !P.menu) return;
     var tg = e.target;
@@ -11175,7 +11176,7 @@ function wire() {
     if (e.touches.length !== 1) return;
     var tch = e.touches[0];
     P.lastTouch = Date.now();
-    start = { x: tch.clientX, y: tch.clientY, t: Date.now(), vol: v.volume, br: +(els.bright.style.opacity || 0), moved: false, side: tch.clientX > window.innerWidth / 2 ? 'r' : 'l' };
+    start = { uiWasVisible: uiVisible(), x: tch.clientX, y: tch.clientY, t: Date.now(), vol: v.volume, br: +(els.bright.style.opacity || 0), moved: false, side: tch.clientX > window.innerWidth / 2 ? 'r' : 'l' };
     longT = setTimeout(function () { if (start && !start.moved) { P.speedHold = v.playbackRate; v.playbackRate = 2; osd('2×'); } }, 550);
   }, { passive: true });
   g.addEventListener('touchmove', function (e) {
@@ -11206,7 +11207,9 @@ function wire() {
     }
     lastTap = now;
     clearTimeout(tapT);
-    tapT = setTimeout(function () { if (uiVisible()) { root.classList.add('idle'); } else showUi(); }, 300);
+    /* single tap toggles the controls based on how they looked when the finger touched the screen */
+    if (!s.uiWasVisible) { showUi(); return; }  /* show instantly; a second tap may still seek */
+    tapT = setTimeout(function () { clearTimeout(P.idleT); root.classList.add('idle'); }, 300);
   });
   showUi();
 }
