@@ -2,7 +2,13 @@ name: CI
 
 on:
   push:
+    branches: [main]
+    tags-ignore: ["v*"]
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   test:
@@ -43,6 +49,12 @@ jobs:
           python -m pip install ruff flake8
           ruff check --isolated localflix.py
           flake8 localflix.py
+
+      - name: Web UI stays ES2019 (old TV browsers)
+        if: matrix.python == '3.13' && runner.os == 'Linux'
+        run: |
+          python localflix.py --dump-web web
+          npx --yes acorn@8 --ecma2019 --silent web/app.js
 
       - name: Self-test
         run: python localflix.py --selftest

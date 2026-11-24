@@ -1,0 +1,27 @@
+name: ✨ Feature request / feedback
+description: Suggest an idea, or tell us a device works (or doesn't)
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What would you like?
+      description: Describe the problem or the idea. What would it let you do?
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you've considered
+  - type: input
+    id: device
+    attributes:
+      label: Device (for compatibility feedback)
+      placeholder: "LG C2 (webOS 22) built-in browser: works"
+  - type: checkboxes
+    id: fit
+    attributes:
+      label: Project fit
+      options:
+        - label: This keeps LocalFlix a single file with no required dependencies
+        - label: I'd be willing to help implement or test this

@@ -5,3 +5,5 @@ output/
 smoke/
 web/
 .claude/
+.ruff_cache/
+dist/

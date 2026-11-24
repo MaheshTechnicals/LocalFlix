@@ -1,0 +1,71 @@
+name: 🐞 Bug report
+description: Something doesn't work as it should
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report this! Please search [existing issues](https://github.com/MaheshTechnicals/LocalFlix/issues) first.
+        **Security problems:** don't post them here. Use [a private report](https://github.com/MaheshTechnicals/LocalFlix/security/advisories/new) instead.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, and what happened instead?
+      placeholder: "I pressed Play on an MKV with DTS audio on my TV and it stays on 'Preparing stream…'"
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open …
+        2. Click …
+        3. See …
+  - type: input
+    id: version
+    attributes:
+      label: LocalFlix version
+      description: "Output of `python3 localflix.py version`"
+      placeholder: "LocalFlix 1.4.1 (Python 3.12.3, Linux, hls.js 1.7.4)"
+    validations:
+      required: true
+  - type: dropdown
+    id: server
+    attributes:
+      label: Where does the server run?
+      options:
+        - Windows
+        - macOS
+        - Linux / Raspberry Pi
+        - Android (Termux)
+        - Docker
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: client
+    attributes:
+      label: Device and browser that shows the problem
+      placeholder: "Samsung TV 2021 (Tizen browser) · iPhone 15 Safari · Chrome 130 on Windows"
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Doctor output
+      description: "Paste the output of `python3 localflix.py doctor`"
+      render: text
+  - type: textarea
+    id: logs
+    attributes:
+      label: Server log / terminal output
+      description: Anything printed around the time of the problem. Remove anything private.
+      render: text
+  - type: textarea
+    id: media
+    attributes:
+      label: Media details (if playback related)
+      description: The codecs from the item's *Info* panel, or `ffprobe` output for the file.
+      render: text
