@@ -102,7 +102,7 @@ jobs:
             org.opencontainers.image.title=LocalFlix
             org.opencontainers.image.description=Your own streaming service for every screen at home — one Python file.
             org.opencontainers.image.licenses=MIT
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64,linux/arm64
