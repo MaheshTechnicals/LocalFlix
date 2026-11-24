@@ -51,6 +51,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import time
 import traceback
@@ -80,7 +81,7 @@ if sys.version_info < (3, 10):  # noqa: UP036  # pragma: no cover
 
 # ===== SECTION: constants =====
 APP_NAME = "LocalFlix"
-VERSION = "1.2.4"
+VERSION = "1.2.5"
 SCHEMA_VERSION = 4
 HLSJS_VERSION = "1.7.4"  # resolved from the npm registry on 2026-11-21
 HLSJS_SHA384 = "p9vgU/7IYJWd3I4STrtqxqR/2cAQlhIX7D/HrTnIMEjjcUox165b7se7sxmm3zDg"
@@ -6865,20 +6866,28 @@ class App:
 
 def print_banner(app: App) -> None:
     urls = app.urls()
-    w = 64
+    cols = shutil.get_terminal_size((80, 24)).columns
+    w = max(20, min(64, cols - 4))
+
+    def say(text: str, color: str = "", indent: int = 2, hang: int = 0) -> None:
+        """Print ``text`` word-wrapped to the terminal (so narrow phone terminals don't garble it)."""
+        for line in (textwrap.wrap(text, max(20, cols - 1), initial_indent=" " * indent,
+                                   subsequent_indent=" " * (indent + hang)) or [""]):
+            print(c(line, color) if color else line)
+
     print()
     print(c("  ╭" + "─" * w + "╮", "red"))
     title = f"{APP_NAME}  v{VERSION}"
     print(c("  │", "red") + c(title.center(w), "bold") + c("│", "red"))
     print(c("  ╰" + "─" * w + "╯", "red"))
-    print(f"  {c('Platform', 'dim')}   {PLAT.describe()} · Python {platform.python_version()}")
+    say(f"Platform   {PLAT.describe()} · Python {platform.python_version()}", hang=11)
     if app.ff.available:
         hw = app.ff.pick_hw(str(app.setting("hwaccel"))) or "software"
-        print(f"  {c('ffmpeg', 'dim')}     {app.ff.version}  ({hw} encoding)")
+        say(f"ffmpeg     {app.ff.version}  ({hw} encoding)", hang=11)
     else:
-        print(f"  {c('ffmpeg', 'dim')}     {c('not found — direct play only', 'yellow')}  → {install_hint()['text']}")
+        say(f"ffmpeg     not found — direct play only → {install_hint()['text']}", "yellow", hang=11)
     for r in app.db.q("SELECT path FROM libraries WHERE enabled=1"):
-        print(f"  {c('Media', 'dim')}      {r[0]}")
+        say(f"Media      {r[0]}", hang=11)
     print()
     print(c("  Open on any device on the same Wi-Fi:", "bold"))
     for i, u in enumerate(urls):
@@ -6886,20 +6895,27 @@ def print_banner(app: App) -> None:
     print(f"    {c('➜', 'green')}  {c(f'http://localhost:{app.port}', 'dim')}  (this computer)")
     if urls and app.setting("show_qr") and sys.stdout.isatty():
         with contextlib.suppress(Exception):
-            print()
-            for line in QRGEN.terminal(urls[0]).splitlines():
-                print("    " + line)
+            qr = QRGEN.terminal(urls[0]).splitlines()
+            qw = max((len(x) for x in qr), default=0)
+            if qw and qw + 2 <= cols:  # skip the QR rather than print a wrapped, unscannable one
+                print()
+                pad = " " * min(4, (cols - qw) // 2)
+                for line in qr:
+                    print(pad + line)
     print()
-    print(c("  On a TV:", "bold") + f" open the TV's web browser and type  {c(urls[0] + '/tv' if urls else '', 'cyan')}")
+    say("On a TV: open the TV's web browser and type", "bold")
+    if urls:
+        print(f"    {c(urls[0] + '/tv', 'cyan')}")
     if not app.setting("require_password") and app.host in ("0.0.0.0", "::"):
-        print(c("  ⚠  No password set — anyone on your Wi-Fi can watch. (Settings → Network & Security)", "yellow"))
+        say("⚠  No password set — anyone on your Wi-Fi can watch. (Settings → Network & Security)", "yellow", hang=3)
     if PLAT.is_windows:
-        print(c("  Tip: if other devices can't connect, allow Python through Windows Firewall (localflix.py doctor).", "dim"))
+        say("Tip: if other devices can't connect, allow Python through Windows Firewall (localflix.py doctor).", "dim", hang=5)
     elif PLAT.is_mac:
-        print(c("  Tip: if macOS asks, allow incoming connections for Python.", "dim"))
+        say("Tip: if macOS asks, allow incoming connections for Python.", "dim", hang=5)
     elif PLAT.is_termux:
-        print(c("  Tip: disable battery optimisation for Termux so streaming isn't interrupted.", "dim"))
-    print(c("  Press Ctrl+C to stop.\n", "dim"))
+        say("Tip: disable battery optimisation for Termux so streaming isn't interrupted.", "dim", hang=5)
+    say("Press Ctrl+C to stop.", "dim")
+    print()
 
 
 # ===== SECTION: wizard =====
@@ -7931,6 +7947,8 @@ def build_parser() -> argparse.ArgumentParser:
 def _can_open_browser() -> bool:
     if PLAT.is_docker:
         return False
+    if PLAT.is_termux:  # Android: the phone's browser is opened through Termux (also from inside proot-distro)
+        return True
     # a headless Linux server / SSH session has no browser to open
     return not (PLAT.is_linux and not PLAT.is_wsl and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")))
 
@@ -7946,13 +7964,26 @@ def open_in_browser(url: str) -> bool:
         except OSError:
             return False
 
-    termux_bin = "/data/data/com.termux/files/usr/bin"
+    termux_prefix = "/data/data/com.termux/files/usr"
     if PLAT.is_termux:
-        for cmd in (["termux-open-url", url], [f"{termux_bin}/termux-open-url", url],
-                    ["am", "start", "-a", "android.intent.action.VIEW", "-d", url],
+        # Inside proot-distro the Termux tools only work with Termux's own environment (PREFIX, PATH, no proot
+        # LD_PRELOAD), so run them with it, and check the exit code so a failing launcher falls through to the next.
+        env = {k: v for k, v in os.environ.items() if k not in ("LD_PRELOAD", "LD_LIBRARY_PATH")}
+        env.update(PREFIX=termux_prefix, HOME=os.environ.get("HOME", "/data/data/com.termux/files/home"),
+                   PATH=f"{termux_prefix}/bin:/system/bin:" + os.environ.get("PATH", ""))
+        for cmd in (["termux-open-url", url], [f"{termux_prefix}/bin/termux-open-url", url],
+                    ["termux-open", url], [f"{termux_prefix}/bin/termux-open", url],
+                    [f"{termux_prefix}/bin/am", "start", "-a", "android.intent.action.VIEW", "-d", url],
                     ["/system/bin/am", "start", "-a", "android.intent.action.VIEW", "-d", url]):
-            if (shutil.which(cmd[0]) or os.path.exists(cmd[0])) and spawn(cmd):
-                return True
+            if not (shutil.which(cmd[0]) or os.path.exists(cmd[0])):
+                continue
+            with contextlib.suppress(OSError, subprocess.SubprocessError):
+                r = subprocess.run(cmd, check=False, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT,
+                                   env=env, timeout=15, **popen_kwargs(False))
+                out = r.stdout.decode(errors="replace").lower()
+                if r.returncode == 0 and "error" not in out and "exception" not in out:
+                    return True
         return False
     if PLAT.is_wsl:
         for cmd in (["wslview", url], ["cmd.exe", "/c", "start", "", url.replace("&", "^&")],

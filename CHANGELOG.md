@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.5 — 2026-11-24
+
+### Fixed
+- **Startup banner garbled on phone terminals:** the box and long lines were fixed at about 68 columns, so a ~50-column Termux screen wrapped them into a mess. The banner now sizes itself to the terminal and word-wraps long lines. The QR code is skipped if it cannot fit unbroken.
+- **Browser did not open automatically on Android (Termux / proot-distro):** the "headless Linux, no DISPLAY" rule also matched Termux, so the opener never ran. Termux now opens the phone's browser at the LAN address. It uses `termux-open-url`, `termux-open` or `am start`, run with Termux's own environment so it works from inside proot. The exit code is checked so a broken launcher falls through to the next.
+
 ## 1.2.4 — 2026-11-24
 
 ### Fixed
