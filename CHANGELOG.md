@@ -1,5 +1,64 @@
 # Changelog
 
+## 1.3.0 — 2026-11-24 (full-source audit)
+
+### Changed
+- **Recently Added shows titles, not episodes:** a series appears once, as the show (poster, season and episode count), ordered by when it last got a new episode. Movies appear as before. The "See all" page (`#/new`) lists the same way, via the new `GET /api/v1/items?type=titles`.
+
+### Fixed — library and scanner
+- **Search index (FTS) re-keyed by rowid.** Deleting by the `UNINDEXED` id column scanned the whole index for every item, so scans got slower with the square of the library size: 8,000 items took 5 s, and 100k files took several minutes while holding the write lock. Migration 5 rebuilds the index.
+- A folder that fails to list (flaky NAS, permission hiccup) no longer marks all its files as missing.
+- Filesystem checks no longer run while the database write lock is held. A stale network mount used to freeze every write.
+- External subtitle lookup caches folder listings. It was O(N²) in folders holding thousands of videos.
+- Periodic mount checks no longer re-run series cleanup when no library was due.
+- Broken files (truncated MP4 header, probe crash, link pointing outside the library) are marked unplayable instead of being re-probed on every scan.
+- Subtitles: UTF-16 files without a BOM are decoded correctly, and VobSub `.idx`/`.sub` pairs no longer show up as empty text tracks.
+- MPEG-TS recordings that start mid-packet are recognised.
+- A "Scan now" pressed during a scan is no longer lost.
+- Background ffmpeg runs at low priority without `preexec_fn`, which is unsafe in a threaded server.
+- The Linux sleep inhibitor ends with the server, even after a crash.
+
+### Fixed — streaming
+- Audio renditions are padded and cut to the planned length, so the last audio segments always exist.
+- Seeking backwards no longer stalls when playback reaches the segments left over from the earlier position.
+- A stopped session can't be revived by an in-flight request, which used to leave an orphan ffmpeg and folder.
+- When ffmpeg exits cleanly at the real end of a stream it is no longer restarted in a loop.
+- A missing init segment (removed by cache cleanup) is regenerated.
+- The transcode limit is now checked and claimed atomically.
+- The sleep-prevention reference count is thread-safe.
+- A corrupt keyframe cache no longer blocks the play request with a slow full-file scan.
+- Artwork: items that produce no artwork no longer loop endlessly (404 → regenerate → event → reload).
+- Trickplay: a failed trickplay is not retried on every play, and on phones it waits while something is streaming.
+
+### Fixed — security and HTTP
+- Switching **Require password** on signs out every device that never entered the password.
+- Changing the admin PIN revokes admin rights from other devices.
+- Login, admin PIN and profile PIN have separate brute-force counters, so knowing one secret no longer resets the lockout of another.
+- With an admin PIN set, LAN devices need the PIN for admin actions even when no password is required. Without a PIN, the server password unlocks admin, as the prompt says.
+- No session rows for health checks or HEAD requests. Docker's healthcheck created one every 30 s.
+- Subtitle warm-up threads release their DB connection.
+- The Host check caches this machine's names. A slow reverse DNS lookup happened on every request.
+- hls.js is loaded with a version query, so upgrades reach browsers.
+- A file that shrinks while being sent closes the connection instead of hanging it. The idle timeout is restored after a transfer.
+- Client disconnects during streaming (TLS EOF, Wi-Fi drop) are not logged as errors.
+- Invalid `startTime` values return 400.
+- The software-fallback path returns 503/404 instead of 500.
+- A second Ctrl+C forces exit, and the browser-open timer no longer delays shutdown.
+- `--host ::` also accepts IPv4 clients on Windows.
+- The systemd unit works when the path contains spaces.
+
+### Fixed — web UI
+- Seek-bar drag cleans up on `pointercancel` (Android back-swipe). Previously the controls could get stuck visible and the next tap would seek.
+- The stall watchdog ignores user pauses. It used to downgrade the stream after a long pause.
+- Old TV browsers (Chromium < 79) get plain CSS fallbacks for `min()`/`max()`/`clamp()`: hero text position, player bar padding, search box, dialogs.
+- Tablets 769–900 px wide get the bottom tab bar; there was no navigation there before.
+- Toasts no longer cover the phone tab bar or the player controls.
+- Player episodes menu: season 0 (specials), failed requests and a closed player are handled.
+- The C/A keys no longer throw before playback has started.
+- Series "Mark watched" only changes state once the server confirms it.
+- Search: typing in the nav box updates the open search page, and a stale debounce no longer rewrites the URL after you leave.
+- Artwork refresh puts posters, not thumbnails, into poster cards.
+
 ## 1.2.5 — 2026-11-24
 
 ### Fixed
