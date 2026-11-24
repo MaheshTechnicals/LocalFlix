@@ -1,0 +1,111 @@
+name: Release
+
+# Push a tag like v1.4.2 (matching VERSION in localflix.py) to publish a release.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)publish, e.g. v1.4.1"
+        required: true
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Check the tag matches VERSION
+        run: |
+          v=$(python -c "import re;print(re.search(r'^VERSION = \"([^\"]+)\"', open('localflix.py').read(), re.M).group(1))")
+          echo "VERSION=$v"
+          test "v$v" = "$TAG" || { echo "::error::Tag $TAG does not match VERSION $v in localflix.py"; exit 1; }
+          echo "VERSION=$v" >> "$GITHUB_ENV"
+
+      - name: Test
+        run: |
+          sudo apt-get update && sudo apt-get install -y ffmpeg
+          python localflix.py --selftest
+
+      - name: Build release files
+        run: |
+          mkdir -p dist/LocalFlix
+          cp localflix.py README.md LICENSE CHANGELOG.md start-windows.bat start-mac.command start-linux.sh start-termux.sh Dockerfile dist/LocalFlix/
+          (cd dist && zip -r "LocalFlix-$VERSION.zip" LocalFlix)
+          cp localflix.py dist/localflix.py
+          (cd dist && sha256sum localflix.py "LocalFlix-$VERSION.zip" > SHA256SUMS.txt)
+          # release notes = this version's CHANGELOG section
+          awk -v v="$VERSION" '
+            $0 ~ "^## " v "( |$)" {on=1; next}
+            on && /^## / {exit}
+            on {print}
+          ' CHANGELOG.md > dist/notes.md
+          cat >> dist/notes.md <<EOF
+
+          ---
+          **Install:** download \`localflix.py\` below and run \`python3 localflix.py\` (Python 3.10+, ffmpeg recommended).
+          **Docker:** \`docker run -d -p 8000:8000 -v /path/to/videos:/media -v localflix-data:/data ghcr.io/${GITHUB_REPOSITORY,,}:$VERSION\`
+          EOF
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/localflix.py "dist/LocalFlix-$VERSION.zip" dist/SHA256SUMS.txt --clobber
+            gh release edit "$TAG" --notes-file dist/notes.md
+          else
+            gh release create "$TAG" dist/localflix.py "dist/LocalFlix-$VERSION.zip" dist/SHA256SUMS.txt \
+              --title "LocalFlix $VERSION" --notes-file dist/notes.md --verify-tag
+          fi
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: release
+    timeout-minutes: 40
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}},value=${{ env.TAG }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ env.TAG }}
+            type=raw,value=latest
+          labels: |
+            org.opencontainers.image.title=LocalFlix
+            org.opencontainers.image.description=Your own streaming service for every screen at home — one Python file.
+            org.opencontainers.image.licenses=MIT
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

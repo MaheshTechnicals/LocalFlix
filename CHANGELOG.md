@@ -1,5 +1,19 @@
 # Changelog
 
+All notable changes to LocalFlix are listed here. Versions follow [semantic versioning](https://semver.org).
+
+## 1.4.2 — 2026-11-24 (open-source release)
+
+### Fixed
+- **Settings on phones:** the category bar scrolls sideways. Tapping a category further along (e.g. *Network & Security*) opened the page but scrolled the bar back to *General*. The bar now keeps its position and keeps the selected category in view.
+
+### Added
+- Open-source project files: MIT `LICENSE`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `SECURITY.md`, issue forms, a pull-request template, Dependabot and `.editorconfig`.
+- **Release workflow:** pushing a `v*` tag tests the code, publishes a GitHub release with `localflix.py`, a zip with launchers and SHA-256 sums, and builds a multi-arch Docker image (`amd64`, `arm64`) on `ghcr.io/maheshtechnicals/localflix`.
+- CI checks that the web UI still parses as ES2019, for old TV browsers.
+- A self-test checks that every UI language has the same translation keys.
+- README rewritten: screenshots, per-platform step-by-step setup, file-naming guide, TV guide, FAQ.
+
 ## 1.4.1 — 2026-11-24
 
 ### Added

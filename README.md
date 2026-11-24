@@ -1,30 +1,95 @@
+<div align="center">
+
+<img src="docs/logo.svg" width="96" alt="LocalFlix logo">
+
 # LocalFlix
 
-**Your own streaming service, in one Python file.** Put videos in a folder, run one command, and every phone, laptop, tablet and smart-TV browser on your Wi-Fi gets a polished streaming interface. It includes multi-audio, subtitles, resume across devices, next episode, seek previews and automatic transcoding.
+**Your own streaming service for every screen at home: phones, laptops and smart TVs.<br>One Python file. No accounts, no cloud, no ads.**
 
-- **One file, no installs:** `localflix.py` uses only the Python standard library (3.10+).
-- **Plays anything:** MKV, MP4, AVI, MOV, TS, WebM, HEVC/H.265, AV1, VP9, AC3/EAC3/DTS/TrueHD, multiple audio tracks, embedded and external subtitles. Files a device can't play are remuxed or transcoded on the fly through ffmpeg.
-- **TV-first:** works with a remote's arrows, OK and Back keys on Samsung (Tizen), LG (webOS), Android TV, Fire TV and other TV browsers.
-- **Private:** LAN only, no telemetry, no account. An optional password/PIN and per-profile PINs are available.
+[![CI](https://github.com/MaheshTechnicals/LocalFlix/actions/workflows/ci.yml/badge.svg)](https://github.com/MaheshTechnicals/LocalFlix/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/MaheshTechnicals/LocalFlix?label=release&color=e50914)](https://github.com/MaheshTechnicals/LocalFlix/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)
+![Platforms](https://img.shields.io/badge/runs%20on-Windows%20%7C%20macOS%20%7C%20Linux%20%7C%20Android%20%7C%20Docker-555)
+![Dependencies](https://img.shields.io/badge/dependencies-none-success)
+
+[**Quick start**](#-quick-start) · [**Screenshots**](#-screenshots) · [**Features**](#-features) · [**Open on your TV**](#-open-on-your-tv) · [**FAQ**](#-faq--troubleshooting) · [**Contributing**](CONTRIBUTING.md)
+
+<img src="docs/screenshots/home.jpg" alt="LocalFlix home screen with a featured title and Continue Watching row" width="100%">
+
+</div>
 
 ---
 
-## 60-second quick start
+## Why LocalFlix?
 
-> Requirement: **Python 3.10 or newer**. **ffmpeg** is strongly recommended. The setup wizard offers to install it.
+You have videos on a laptop, a PC, a Raspberry Pi or even your Android phone. LocalFlix turns that folder into a polished streaming app that every device on your Wi-Fi can open in its **web browser**, with nothing to install on them.
 
-### Windows 10/11
+- 🗂️ **Drop files in a folder.** Movies, shows, seasons and episodes are recognised from file names, with posters and thumbnails.
+- 📺 **Plays anything, everywhere.** MKV, HEVC, AV1, DTS, multiple audio tracks, subtitles. Files a device can't play directly are converted on the fly with ffmpeg.
+- ⏯️ **Pick up where you left off** on any device: Continue Watching, next-episode countdown, seek-bar previews.
+- 🎮 **TV-first.** Use your remote's arrows, OK and Back in Samsung, LG, Android TV and Fire TV browsers.
+- 🔒 **Private by design.** Runs only on your home network, no telemetry. Optional password, admin PIN, kids profiles and free HTTPS.
+- 🪶 **One file.** `localflix.py` uses only the Python standard library. Updating means replacing one file.
+
+> The titles in the screenshots are fictional demo videos generated for this README.
+
+---
+
+## 📸 Screenshots
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/details.jpg" alt="Series details with seasons and episodes"><br><sub><b>Details</b>: seasons, episodes, resume, My List</sub></td>
+    <td width="50%"><img src="docs/screenshots/player.jpg" alt="Video player with controls"><br><sub><b>Player</b>: audio and subtitle tracks, speed, quality, PiP, seek previews</sub></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/library.jpg" alt="Movies library with poster cards and filters"><br><sub><b>Library</b>: posters, filters by genre, resolution, HDR, unwatched</sub></td>
+    <td width="50%"><img src="docs/screenshots/tv.jpg" alt="TV mode on a 1080p screen"><br><sub><b>TV mode</b>: big type, remote-friendly focus, no mouse needed</sub></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/mobile.jpg" alt="Phone layout: home and series page"><br><sub><b>Phones</b>: bottom tab bar, double-tap to seek, fullscreen landscape</sub></td>
+    <td width="50%"><img src="docs/screenshots/settings.jpg" alt="Settings: choosing which videos to show"><br><sub><b>Settings</b>: one folder, common video folders, or the whole device</sub></td>
+  </tr>
+</table>
+
+---
+
+## 🚀 Quick start
+
+**You need:** Python **3.10 or newer**. **[ffmpeg](https://ffmpeg.org)** is strongly recommended; without it only browser-friendly MP4/WebM files play.
+
+### 1. Get LocalFlix
+
+Download the single file from the [latest release](https://github.com/MaheshTechnicals/LocalFlix/releases/latest):
+
+```bash
+curl -LO https://github.com/MaheshTechnicals/LocalFlix/releases/latest/download/localflix.py
+```
+
+<sub>On Windows, use PowerShell: `Invoke-WebRequest https://github.com/MaheshTechnicals/LocalFlix/releases/latest/download/localflix.py -OutFile localflix.py`. Or download the **LocalFlix-x.y.z.zip** from the release page (it includes double-click launchers), or `git clone` this repository.</sub>
+
+### 2. Install Python and ffmpeg, then start it
+
+<details open>
+<summary><b>🪟 Windows 10 / 11</b></summary>
+
 ```bat
 winget install Python.Python.3.13
+```
+```bat
 winget install Gyan.FFmpeg
 ```
-Then double-click **`start-windows.bat`**, or run:
+Close and reopen the terminal, then start LocalFlix (or double-click **`start-windows.bat`** from the zip):
 ```bat
 py localflix.py
 ```
-Allow Python through the firewall when Windows asks.
+When Windows Firewall asks, allow **Private networks**.
+</details>
 
-### macOS
+<details>
+<summary><b>🍎 macOS</b></summary>
+
 ```bash
 brew install python ffmpeg
 ```
@@ -32,8 +97,11 @@ brew install python ffmpeg
 python3 localflix.py
 ```
 Or double-click **`start-mac.command`**. If macOS asks, allow incoming connections for Python.
+</details>
 
-### Linux / Raspberry Pi OS / WSL
+<details>
+<summary><b>🐧 Linux / Raspberry Pi OS / WSL</b></summary>
+
 ```bash
 sudo apt install python3 ffmpeg
 ```
@@ -41,54 +109,98 @@ sudo apt install python3 ffmpeg
 python3 localflix.py
 ```
 Fedora: `sudo dnf install python3 ffmpeg` · Arch: `sudo pacman -S python ffmpeg` · Alpine: `sudo apk add python3 ffmpeg`
+</details>
 
-### Android (Termux)
-```bash
-pkg install python ffmpeg
-```
-```bash
-termux-setup-storage
-```
-```bash
-sh start-termux.sh
-```
+<details>
+<summary><b>🤖 Android (Termux)</b></summary>
 
-### Docker
-```bash
-docker build -t localflix .
-```
-```bash
-docker run -d --name localflix -p 8000:8000 -v /path/to/videos:/media -v localflix-data:/data localflix
-```
-On Linux, `--network host` makes the banner show your real LAN address.
+1. Install **Termux** from [F-Droid](https://f-droid.org/packages/com.termux/). The Play Store build is outdated.
+2. Install Python and ffmpeg:
+   ```bash
+   pkg install python ffmpeg
+   ```
+3. Let Termux read your phone's storage (tap **Allow**):
+   ```bash
+   termux-setup-storage
+   ```
+4. Start LocalFlix and point it at your phone's videos:
+   ```bash
+   python localflix.py -f ~/storage/shared/Movies -f ~/storage/shared/Download
+   ```
 
-### With uv
+See the [Termux guide](#-android-termux-guide) for battery and auto-start tips.
+</details>
+
+<details>
+<summary><b>🐳 Docker</b></summary>
+
+```bash
+docker run -d --name localflix -p 8000:8000 \
+  -v /path/to/videos:/media -v localflix-data:/data \
+  ghcr.io/maheshtechnicals/localflix:latest
+```
+Images are built for `amd64` and `arm64` (including Raspberry Pi 4/5). On Linux, add `--network host` so the banner shows your real LAN address. To build it yourself instead, run `docker build -t localflix .`.
+</details>
+
+<details>
+<summary><b>⚡ With uv</b></summary>
+
 ```bash
 uv run localflix.py
 ```
+</details>
 
-On first run a short wizard asks for your media folder (default `./output` next to the script), port and an optional PIN. It then caches the hls.js player and tests your hardware encoders. The terminal prints every address to open, with a QR code:
+### 3. First run
 
-```
-  Open on any device on the same Wi-Fi:
-    ➜  http://192.168.1.20:8000   (best)
-```
-
-Drop videos into the folder. They appear within a minute (or press **Rescan**).
+1. A short **setup wizard** asks for your media folder (default: `output/` next to the script), the port, and an optional PIN.
+2. LocalFlix caches the player library and tests your hardware video encoders.
+3. The terminal prints the address to open, with a **QR code** for phones:
+   ```
+     Open on any device on the same Wi-Fi:
+       ➜  http://192.168.1.20:8000   (best)
+   ```
+4. Open that address on any phone, laptop or TV on the same Wi-Fi. On the computer itself, a browser opens automatically.
+5. Put videos in the folder. They appear within a minute, or press **Rescan**.
 
 ---
 
-## Choosing which videos LocalFlix shows
+## 📁 Naming your files
 
-Out of the box LocalFlix indexes **one folder** only (`./output`, or whatever you pick in the wizard). Nothing else on the device is touched until you choose more in **Settings → Libraries → Which videos to show**, in the wizard, with `--scope`, or from the buttons on the empty-library screen:
+LocalFlix understands common naming styles. These layouts work best:
+
+```text
+Movies/
+├── Glass Harbor (2024).mkv
+├── Glass Harbor (2024)-poster.jpg        ← optional poster
+└── Echoes of Saturn (2023)/
+    ├── Echoes of Saturn (2023).mp4
+    └── Echoes of Saturn (2023).en.srt    ← external subtitles
+TV Shows/
+└── Starfall Station/
+    ├── poster.jpg                        ← optional show poster
+    ├── Season 01/
+    │   ├── Starfall Station - S01E01 - Arrival.mkv
+    │   └── Starfall Station - S01E02.mkv
+    └── Season 02/
+        └── Starfall.Station.S02E01.1080p.WEB-DL.mkv
+```
+
+`S01E02`, `1x02`, `Season 1/Episode 2`, `Show - 102` and multi-episode files (`S01E01-E02`) are all recognised. Posters can come from `poster.jpg`, `folder.jpg`, `<name>-poster.jpg`, `fanart.jpg`, or optionally from TMDB. Otherwise LocalFlix generates thumbnails from the video.
+
+---
+
+## 📂 Choosing which videos LocalFlix shows
+
+Out of the box LocalFlix indexes **one folder** only. Nothing else on the device is touched until you choose more in **Settings → Libraries → Which videos to show**, in the wizard, or with `--scope`:
 
 | Scope | What gets indexed |
 |---|---|
-| **Only my folders** (default) | Just the folders you add with *Add folder* (any path, any drive). |
-| **Common video folders** | Your platform's standard folders plus USB drives and SD cards as they are plugged in. |
-| **Entire device** | Everything above plus your whole home folder and every drive. System, app and developer folders are skipped. |
+| **Only my folders** (default) | Just the folders you add with *Add folder* (any path, any drive) |
+| **Common video folders** | Your platform's standard video folders, plus USB drives and SD cards as they are plugged in |
+| **Entire device** | Everything above plus your home folder and every drive. System, app and developer folders are skipped |
 
-Folders per platform for *Common*:
+<details>
+<summary>Which folders count as "common" on each platform</summary>
 
 | Platform | Folders |
 |---|---|
@@ -98,74 +210,101 @@ Folders per platform for *Common*:
 | Android (Termux) | Movies, Download, DCIM (camera), Videos, Telegram, WhatsApp Video, SD cards. Run `termux-setup-storage` once |
 
 *Entire device* adds the home folder (Linux/macOS), all fixed and removable drives (Windows; network and CD drives are skipped), the Windows drives under WSL, and internal storage (Android).
+</details>
 
-```bash
-python localflix.py --scope common
-```
-
-How it behaves:
-- **Your own folders always win.** If a folder you added sits inside an auto-detected one (e.g. `~/Videos/Anime` inside the home folder), its files belong to your folder and its type (Movies / TV Shows) applies. No file is listed twice, and watch history moves along with the file.
-- **Auto folders show an *Auto* badge.** The bin icon *hides* them. Discovery never brings a hidden folder back, and its watch history is kept if you show it again.
-- **Unplugged drives and SD cards** show as *Not connected*. Their videos are hidden, not deleted, and come back with their watch history when the drive returns. New drives are picked up within about a minute.
-- **Skipped in auto folders:** system and app folders (`Windows`, `Program Files`, `AppData`, `Library`, `node_modules`, `.cache`, `Android/data`, `*.app`, photo-library packages, …), LocalFlix's own cache, and files smaller than *auto_min_size_mb* (default 2 MB: app sounds, ads, thumbnails).
-- `.ts` files are only treated as video if they really are MPEG transport streams, so TypeScript files are never indexed.
-- **Scan timing:** auto folders can be huge, so they are rescanned every *auto_scan_interval* (default 30 min) instead of every minute. *Rescan library* forces a scan now.
-- **Privacy:** with *Common* or *Entire device*, everyone who can open LocalFlix on your network sees those videos. Set a password under Network & Security if that matters.
+- **Your own folders win.** If a folder you added sits inside an auto-detected one, its files belong to your folder. Nothing is listed twice, and watch history follows the file.
+- **Unplugged drives and SD cards** show as *Not connected*. Their videos are hidden, not deleted, and come back with their watch history.
+- **Skipped automatically:** system and app folders (`Windows`, `Program Files`, `AppData`, `Library`, `node_modules`, `Android/data`, …), tiny files (under 2 MB by default), and `.ts` files that are really TypeScript.
+- **Privacy:** with *Common* or *Entire device*, everyone who can open LocalFlix on your network sees those videos. Set a password if that matters.
 
 ---
 
-## Open on your TV
+## 📺 Open on your TV
 
 1. Make sure the TV and the computer running LocalFlix are on the **same Wi-Fi / network**.
 2. Open the TV's web browser: *Samsung Internet* (Tizen), *Web Browser* (LG webOS), *Silk* (Fire TV), *Chrome* or *TV Bro* (Android TV / Google TV).
-3. Type the address shown in the terminal and add **`/tv`**, for example `http://192.168.1.20:8000/tv`.
-4. TV mode turns on automatically: big text, focus highlight, no mouse needed.
+3. Type the address from the terminal and add **`/tv`**, for example `http://192.168.1.20:8000/tv`.
+4. TV mode turns on: big text, a clear focus highlight, and everything works with the remote.
 
-   *Screenshot placeholder: TV home screen*
+<img src="docs/screenshots/tv.jpg" alt="LocalFlix TV mode" width="100%">
 
 | Remote key | Action |
 |---|---|
-| Arrows | Move between items · in the player ←/→ seek ±10 s (hold to speed up), ↑ show controls |
-| OK / Enter | Open / play / pause |
-| Back | Close dialog → leave the player → previous page. Press twice on Home to exit |
-| Play/Pause, Stop, ⏪ ⏩, ⏭ | Media keys work in the player |
+| ⬆️ ⬇️ ⬅️ ➡️ | Move between items. In the player, ←/→ seek ±10 s (hold to go faster) and ↑ shows the controls |
+| **OK** / Enter | Open · play · pause |
+| **Back** | Close a dialog → leave the player → previous page (press twice on Home to exit) |
+| ⏯ ⏹ ⏪ ⏩ ⏭ | Media keys work in the player |
 | 🔴 🟢 🟡 🔵 | Subtitles · Audio · Speed · Next episode |
 
-Tip: on the computer, click **Open on TV** in the top bar for a big address and a QR code. If you set a password, an admin can create a **one-time login QR**, so nobody has to type a password with a remote.
+**Tip:** on the computer, click **Open on TV** in the top bar for a big address and a QR code. If you set a password, an admin can create a **one-time login QR**, so nobody has to type a password with a remote.
 
 ---
 
-## Features
+## ✨ Features
 
 | Area | What you get |
 |---|---|
-| Library | Automatic movie / TV-show / episode detection from file and folder names, seasons, posters from local `poster.jpg`/`fanart.jpg` or generated frames, optional TMDB metadata, instant search |
-| Playback | Direct Play when the device supports the file. Otherwise Direct Stream (remux, video copied) or Transcode (H.264, hardware accelerated when available). Instant seeking anywhere, even while transcoding |
-| Audio | Every audio track selectable, instant switching, preferred-language auto-pick, 5.1 → stereo downmix, optional AC3/EAC3 passthrough |
-| Subtitles | Embedded text subs, external `.srt .vtt .ass .ssa .sub .ttml` (`Movie.en.srt`, `Movie.hi.forced.srt`, `Subs/`), image subs (PGS/VobSub) burned in. Size, colour, background, edge, position and delay settings |
-| Player | Resume, Skip Intro/Credits (from chapters), next-episode countdown, seek-bar thumbnails, chapters, speed, quality, sleep timer, fit/fill/crop, PiP, AirPlay, Cast (Remote Playback), lock-screen controls, stats overlay |
-| Profiles | "Who's watching?", per-profile PIN, kids profiles, Continue Watching and My List synced across every device |
-| Security | LAN only by default, optional password/PIN, admin PIN, rate-limited login, private-network-only filter, files outside your folders are never served |
+| **Library** | Automatic movie / TV-show / episode detection, seasons, local posters or generated thumbnails, optional TMDB metadata, instant search, filters (genre, resolution, HDR, multi-audio, unwatched) |
+| **Playback** | Direct Play when the device supports the file, otherwise Direct Stream (remux) or Transcode (H.264, hardware-accelerated with NVENC / QSV / VAAPI / VideoToolbox when available). Instant seeking anywhere, even while transcoding |
+| **Audio** | Every audio track selectable with instant switching, preferred-language auto-pick, 5.1 → stereo downmix, optional AC3/EAC3 passthrough |
+| **Subtitles** | Embedded text subs; external `.srt .vtt .ass .ssa .sub .ttml` (`Movie.en.srt`, `Movie.hi.forced.srt`, `Subs/`); image subs (PGS/VobSub) burned in. Size, colour, background, edge, position and delay settings |
+| **Player** | Resume, Skip Intro/Credits (from chapters), next-episode countdown that stays fullscreen, seek-bar thumbnails, speed, quality, sleep timer, fit/fill/crop, PiP, AirPlay, Cast, lock-screen controls, stats overlay |
+| **Profiles** | "Who's watching?", per-profile PIN, kids profiles with rating limits, Continue Watching and My List synced across devices |
+| **Network** | Address + QR code in the terminal, auto-opens the browser, mDNS name, [fixed DuckDNS address and free HTTPS](#-fixed-address--free-https), autostart at login |
+| **Security** | LAN-only by default, optional password, admin PIN, rate-limited logins, DNS-rebinding and CSRF protection, files outside your folders are never served |
+| **Languages** | English and हिन्दी (Hindi). [Add yours](CONTRIBUTING.md#translations) |
 
-### Keyboard shortcuts (player)
-`Space`/`K` play · `J`/`L` ±10 s · `←`/`→` ±5 s · `↑`/`↓` volume · `M` mute · `F` fullscreen · `C` subtitles · `A` audio · `[`/`]` subtitle delay · `<`/`>` speed · `N` next · `I` stats · `0–9` jump to 0–90 % · `Esc` back · `?` help
+### Player controls
 
-### Touch (phones/tablets)
-Double-tap left/right to skip ±10 s · tap to show controls · long-press for 2× speed · swipe up/down on the right for volume, on the left for brightness.
+**Keyboard:** `Space`/`K` play · `J`/`L` ±10 s · `←`/`→` ±5 s · `↑`/`↓` volume · `M` mute · `F` fullscreen · `C` subtitles · `A` audio · `[`/`]` subtitle delay · `<`/`>` speed · `N` next · `I` stats · `0–9` jump to 0–90 % · `Esc` back · `?` help
+
+**Touch:** double-tap left/right to skip ±10 s · double-tap the middle for fullscreen · tap to show the controls · long-press for 2× speed · swipe up/down on the right for volume, on the left for brightness.
 
 ---
 
-## Supported formats
+## 🎞️ Supported formats
 
 | Container | Video | Audio | Subtitles |
 |---|---|---|---|
-| MP4, M4V, MOV, MKV, WebM, AVI, TS/M2TS, MPG, WMV, FLV, OGV, 3GP, VOB, DivX | H.264, HEVC (8/10-bit, HDR10/HLG/Dolby Vision*), AV1, VP9, VP8, MPEG-4/Xvid, MPEG-2, VC-1, … | AAC, MP3, Opus, Vorbis, FLAC, AC3, EAC3, DTS, TrueHD, PCM, … | SRT, ASS/SSA, WebVTT, mov_text, MicroDVD, TTML, PGS, VobSub, DVB |
+| MP4, M4V, MOV, MKV, WebM, AVI, TS/M2TS, MPG, WMV, FLV, OGV, 3GP, VOB, DivX | H.264, HEVC (8/10-bit, HDR10/HLG/Dolby Vision\*), AV1, VP9, VP8, MPEG-4/Xvid, MPEG-2, VC-1, … | AAC, MP3, Opus, Vorbis, FLAC, AC3, EAC3, DTS, TrueHD, PCM, … | SRT, ASS/SSA, WebVTT, mov_text, MicroDVD, TTML, PGS, VobSub, DVB |
 
-\*HDR is tone-mapped to SDR for screens that can't show HDR. Anything the browser can't decode is converted by ffmpeg. Without ffmpeg only browser-native files (usually MP4/WebM with H.264/AAC) play.
+\*HDR is tone-mapped to SDR for screens that can't show HDR. Anything the browser can't decode is converted by ffmpeg.
 
 ---
 
-## Command line
+## 🔒 Fixed address & free HTTPS
+
+Your router may give the server a different IP every day (`192.168.0.103` today, `.107` tomorrow), which breaks bookmarks and TV shortcuts. LocalFlix can keep a free **DuckDNS** name pointed at whatever IP it has right now. You get one address that never changes, and it is also the name a free, trusted **HTTPS** certificate is issued for. No router changes are needed.
+
+1. Go to [duckdns.org](https://www.duckdns.org), sign in, add a sub domain (e.g. `myflix`) and copy your **token**.
+2. In LocalFlix open **Settings → Network & Security** and fill in *DuckDNS domain* (`myflix`) and *DuckDNS token*.
+   - LocalFlix checks the IP every 2 minutes and updates the name when it changes.
+   - Every device can now use `http://myflix.duckdns.org:8000`.
+   - The name only points at your private Wi-Fi address, so nothing becomes reachable from the internet.
+3. **HTTPS (optional).** On the server run:
+   ```bash
+   python3 localflix.py https
+   ```
+   It installs the free [acme.sh](https://github.com/acmesh-official/acme.sh) client (it asks first), proves you own the name through DuckDNS (a DNS check, no open ports), and saves a Let's Encrypt certificate for LocalFlix.
+4. Restart LocalFlix and open `https://myflix.duckdns.org:8000`. You won't see a warning on any device.
+
+What happens after that:
+- **Renewal:** LocalFlix checks daily (certificates last 90 days) and loads the new certificate without a restart.
+- **Opening by IP:** a device that opens LocalFlix by IP, even `192.168.0.x:8000` typed without `https://`, moves to the name automatically if the name works on that device. Turn this off with Settings → Network → *Domain redirect*.
+- **Turning it off:** run `python3 localflix.py https --off` to go back to plain HTTP.
+
+<details>
+<summary>Notes and limits</summary>
+
+- **What it needs:** `openssl` and `curl`. On Termux, run `apt install openssl curl` inside proot. On Windows, run the `https` step inside WSL, or use any ACME client and set the certificate and key paths in Settings.
+- **Router blocks the name:** some routers block names that point at private addresses ("DNS rebinding protection"). Those devices simply stay on the IP address.
+- **Plain IP over HTTPS:** with HTTPS on, the IP addresses still work, but the browser shows a certificate warning for them.
+- **Old TVs:** some TV browsers from before about 2017 don't trust Let's Encrypt. Keep HTTPS off if you have one of these.
+</details>
+
+---
+
+## 💻 Command line
 
 ```text
 python localflix.py                         serve (first run → setup wizard)
@@ -174,8 +313,8 @@ python localflix.py serve -f DIR [-f DIR2] [--scope folders|common|all] [-p PORT
 python localflix.py setup                   interactive wizard
 python localflix.py doctor [--full|--json]  diagnostics (also in Settings → Advanced)
 python localflix.py scan [--full]           rescan libraries, then exit
-python localflix.py clear-cache [--all]
-python localflix.py service [print|install|uninstall]   start automatically at login/boot
+python localflix.py clear-cache [--all]     delete thumbnails, HLS segments and subtitle caches
+python localflix.py service [print|install|uninstall]   start automatically at login / boot
 python localflix.py https [--domain NAME --token TOKEN] [--yes] [--off]   free trusted HTTPS (DuckDNS + Let's Encrypt)
 python localflix.py version
 python localflix.py --selftest              built-in test suite
@@ -183,42 +322,36 @@ python localflix.py --dump-web DIR          write the embedded web files (edit, 
 python localflix.py fixtures DIR            generate test videos with ffmpeg
 ```
 
-Environment overrides: `LOCALFLIX_HOME` (data folder), `LOCALFLIX_PORT`, `LOCALFLIX_MEDIA`, `FFMPEG_PATH`.
+**Environment variables:** `LOCALFLIX_HOME` (data folder), `LOCALFLIX_PORT`, `LOCALFLIX_MEDIA`, `FFMPEG_PATH`.
 
-Data locations: Windows `%APPDATA%\LocalFlix` + `%LOCALAPPDATA%\LocalFlix\Cache` · macOS `~/Library/Application Support/LocalFlix` + `~/Library/Caches/LocalFlix` · Linux/Termux `~/.config/localflix` + `~/.cache/localflix`. Logs are in `<config>/logs`.
+**Where data is stored:**
+
+| OS | Settings and database | Cache |
+|---|---|---|
+| Windows | `%APPDATA%\LocalFlix` | `%LOCALAPPDATA%\LocalFlix\Cache` |
+| macOS | `~/Library/Application Support/LocalFlix` | `~/Library/Caches/LocalFlix` |
+| Linux / Termux | `~/.config/localflix` | `~/.cache/localflix` |
+
+Logs are in `<settings folder>/logs`.
 
 ### Start automatically
-`python localflix.py service` prints the right file for your OS: a systemd *user* unit (Linux), a launchd agent (macOS), a Startup-folder `.bat` and `schtasks` command (Windows), or a Termux:Boot script. `service install` writes and enables it, and no admin rights are needed.
+
+`python localflix.py service` prints the right autostart file for your OS:
+
+| OS | What it creates |
+|---|---|
+| Linux | a systemd *user* unit |
+| macOS | a launchd agent |
+| Windows | a Startup-folder `.bat` and a `schtasks` command |
+| Android | a Termux:Boot script |
+
+`python localflix.py service install` writes and enables it. No admin rights are needed.
 
 ---
 
-## A fixed address and free HTTPS (no router changes)
+## 🧱 Firewall fixes
 
-Your router may give the server a different IP every day (`192.168.0.103` today, `.107` tomorrow), which breaks bookmarks and TV shortcuts. LocalFlix can keep a free **DuckDNS** name pointed at whatever IP it has right now. You get one address that never changes, and it is also the name a free, trusted **HTTPS** certificate is issued for.
-
-1. Go to [duckdns.org](https://www.duckdns.org), sign in, add a sub domain (e.g. `myflix`) and copy your **token**.
-2. In LocalFlix, open **Settings → Network & Security** and enter *DuckDNS domain* (`myflix`) and *DuckDNS token*. LocalFlix checks the IP every 2 minutes and updates DuckDNS when it changes. The name only points at your private Wi-Fi address, so nothing becomes reachable from the internet.
-   Every device can now use `http://myflix.duckdns.org:8000`.
-3. **HTTPS (optional):** on the server run
-   ```bash
-   python3 localflix.py https
-   ```
-   This step:
-   - sets up the free [acme.sh](https://github.com/acmesh-official/acme.sh) client (it asks before installing);
-   - proves you own the name through DuckDNS (a DNS check, so no open ports are needed);
-   - gets a Let's Encrypt certificate and saves it for LocalFlix.
-
-   Restart LocalFlix and open `https://myflix.duckdns.org:8000`. You won't see a warning on any device. A device that opens LocalFlix by IP, including `192.168.0.x:8000` typed without `https://`, is moved to the name automatically if the name works on that device. You can turn this off with Settings → Network → *Domain redirect*. LocalFlix checks for renewal daily (certificates last 90 days) and loads the new certificate without a restart. Run `python3 localflix.py https --off` to go back to plain HTTP.
-
-Notes:
-- **What it needs:** `openssl` and `curl` (Termux/proot: `apt install openssl curl`). On Windows, run the `https` step inside WSL, or use any ACME client and set the certificate and key paths in Settings.
-- **Router blocks the name:** some routers block names that point at private addresses ("DNS rebinding protection"). If `myflix.duckdns.org` doesn't resolve at home, use the IP address. The phone's own mobile data DNS or a public DNS (8.8.8.8) on the device also works.
-- **Plain IP over HTTPS:** with HTTPS on, the IP addresses still work, but the browser shows a certificate warning for them.
-- **Old TVs:** some TV browsers from before about 2017 don't trust Let's Encrypt. Use the `http://` DuckDNS name on those, which means HTTPS must be off.
-
-## Firewall fixes
-
-- **Windows:** when the prompt appears, allow *Private networks*. Missed it? Run in an **admin** terminal:
+- **Windows:** when the prompt appears, allow *Private networks*. If you missed it, run in an **admin** terminal:
   ```bat
   netsh advfirewall firewall add rule name="LocalFlix" dir=in action=allow protocol=TCP localport=8000
   ```
@@ -234,59 +367,98 @@ Notes:
 
 ---
 
-## Termux guide (Android)
+## 🤖 Android (Termux) guide
 
-1. Install **Termux** from F-Droid (the Play Store build is outdated).
-2. Run `pkg install python ffmpeg` and `termux-setup-storage` (grant the permission).
-3. Point LocalFlix at your phone's videos, for example: `python localflix.py -f ~/storage/shared/Movies -f ~/storage/shared/Download`.
-4. **Keep it running:** `start-termux.sh` takes a wake-lock automatically. Also open Android Settings → Apps → Termux → Battery → *Unrestricted*.
-5. **Hotspot:** you can serve to a laptop connected to the phone's hotspot. The banner lists every address.
-6. **Start on boot:** install **Termux:Boot**, open it once, then run `python localflix.py service install`.
-
-Phones transcode slowly. Prefer MP4/H.264 files, or set *Max streaming quality* to 720p.
+1. **Keep it running:** `sh start-termux.sh` takes a wake-lock automatically. Also open Android Settings → Apps → Termux → Battery → **Unrestricted**.
+2. **Hotspot:** you can serve to a laptop or TV connected to the phone's hotspot. The banner lists every address.
+3. **Start on boot:** install **Termux:Boot**, open it once, then run `python localflix.py service install`.
+4. **Performance:** phones transcode slowly. Prefer MP4/H.264 files, or set *Max streaming quality* to 720p.
+5. **proot-distro (Debian/Ubuntu inside Termux):** this works too. LocalFlix opens the phone's browser through Termux.
 
 ---
 
-## FAQ / troubleshooting
+## ❓ FAQ / troubleshooting
 
-**No sound?** The audio is probably AC3/DTS/TrueHD and your browser can't decode it. Install the full ffmpeg (see Quick start) and LocalFlix will convert the audio to AAC. Run `doctor` to confirm ffmpeg is found.
+<details>
+<summary><b>No sound?</b></summary>
 
-**Buffering or slow start?** Lower *Max streaming quality* (Settings → Playback), enable hardware acceleration (Settings → Transcoding → *Re-detect*), or use the wired network for the server. Remuxed files (MKV with H.264) start almost instantly. Full transcodes need a reasonably fast CPU or GPU.
+The audio is probably AC3/DTS/TrueHD, which most browsers can't decode. Install ffmpeg (see Quick start) and LocalFlix converts the audio to AAC automatically. Run `python localflix.py doctor` to confirm ffmpeg is found.
+</details>
 
-**My TV can't open the page.** Type the raw IP address (not `localflix.local`, which many TVs can't resolve). Use `http://`, not `https://`, unless you set up HTTPS (see *A fixed address and free HTTPS*). Check the firewall and that both devices are on the same network, not a guest Wi-Fi.
+<details>
+<summary><b>Buffering or slow start?</b></summary>
 
-**A file doesn't show up.** Check that the extension is supported and the file isn't named like a release sample (`sample.mkv`, `*-sample.*`). Then press *Rescan* or run `python localflix.py scan`. Errors appear under Settings → Libraries.
+Try these, in order:
+- Lower *Max streaming quality* (Settings → Playback).
+- Enable hardware acceleration (Settings → Transcoding → *Re-detect*).
+- Connect the server with a cable.
 
-**Wrong show/episode detected?** Use `Show Name/Season 01/Show Name - S01E02.mkv` or `Movies/Title (2019)/Title (2019).mkv`.
+MKV files with H.264 video are remuxed and start almost instantly. Full transcodes need a reasonably fast CPU or GPU.
+</details>
 
-**Subtitles out of sync?** Press `[` / `]` (or use the subtitles menu) to shift them by 250 ms.
+<details>
+<summary><b>My TV can't open the page.</b></summary>
 
-**hls.js not cached (offline install)?** Safari and many TVs play HLS natively. Otherwise connect once to the internet and LocalFlix downloads and verifies hls.js automatically.
+Type the raw IP address (not `localflix.local`, which many TVs can't resolve). Use `http://` unless you set up [HTTPS](#-fixed-address--free-https). Check the firewall, and check that both devices are on the same network (not a guest Wi-Fi).
+</details>
 
-**Reset everything?** Stop the server and delete the data folder listed under *Data locations*.
+<details>
+<summary><b>A file doesn't show up.</b></summary>
+
+Check that the extension is supported and the file isn't named like a release sample (`sample.mkv`, `*-sample.*`). Then press *Rescan* or run `python localflix.py scan`. Errors appear under Settings → Libraries.
+</details>
+
+<details>
+<summary><b>Wrong show or episode detected?</b></summary>
+
+Use `Show Name/Season 01/Show Name - S01E02.mkv` or `Movies/Title (2019)/Title (2019).mkv`. See [Naming your files](#-naming-your-files).
+</details>
+
+<details>
+<summary><b>Subtitles out of sync?</b></summary>
+
+Press `[` / `]`, or use the subtitles menu, to shift them by 250 ms.
+</details>
+
+<details>
+<summary><b>Offline install: hls.js not cached?</b></summary>
+
+Safari and many TVs play HLS natively. Otherwise, connect to the internet once and LocalFlix downloads and verifies hls.js automatically.
+</details>
+
+<details>
+<summary><b>How do I update or uninstall?</b></summary>
+
+- **Update:** replace `localflix.py` with the [latest release](https://github.com/MaheshTechnicals/LocalFlix/releases/latest) and restart. Your library, watch history and settings are kept.
+- **Uninstall:** run `python localflix.py service uninstall` (if you enabled autostart), delete `localflix.py`, and delete the data folders listed under [Command line](#-command-line). Your videos are never modified.
+</details>
 
 ---
 
-## Development
+## 🛠️ Development
 
-- Everything lives in `localflix.py`, split into `# ===== SECTION: name =====` blocks: platform, settings, database, ffmpeg, name-parser, probe, subtitles, scanner, artwork, tmdb, library-queries, playback-decision, hls-engine, qr, auth, http, install-helpers, doctor, app, wizard, service, fixtures, selftest, cli, web-ui.
-- UI work: `python localflix.py --dump-web web/`, then `python localflix.py --dev-web web/` and edit `web/app.js` / `web/app.css` live. Paste the files back into the `APP_JS` / `APP_CSS` constants when done. The core JS must stay ES2019, with no `?.` or `??`.
-- Tests: `python localflix.py --selftest` covers the name parser, Range parsing, MIME map, segment tables, a 37-case playback decision matrix, subtitles, path safety, settings and schema migrations, QR, and API contract tests that run a real server with generated fixture media, including on-demand HLS, transcode, auth and CSRF.
-- Lint: `ruff check --isolated localflix.py` and `flake8 localflix.py`.
+Everything lives in `localflix.py`, split into `# ===== SECTION: name =====` blocks. The web UI is embedded and stays ES2019 for old TV browsers.
 
-### Verification status
+```bash
+python3 localflix.py --selftest
+```
 
-Verified automatically on Linux (Python 3.12, ffmpeg 6.1):
-- self-test (27 tests);
-- HLS timestamp alignment across seeks for remux (B-frame and MPEG-TS sources) and transcode;
-- 10,000-file library: Home ~50 ms, search ~15 ms;
-- no orphaned ffmpeg after SIGTERM or SIGKILL;
-- Chromium UI walkthrough: profiles, home, details, playback with audio switching and subtitles, TV-mode D-pad navigation, settings, Open-on-TV modal.
+The self-test covers the name parser, Range requests, segment tables, a 37-case playback decision matrix, subtitles, path safety, migrations, translations, and API tests against a real server with generated media.
 
-Still to verify by hand on real hardware (PRD §16.2): Windows / macOS / Raspberry Pi / Termux first-run, Samsung/LG/Android TV browsers, Safari/iOS native HLS, a Lighthouse audit, and HW encoders (NVENC/QSV/VAAPI/VideoToolbox) on machines that have them.
+See **[CONTRIBUTING.md](CONTRIBUTING.md)** for the architecture map, live UI editing, checks and the release process.
 
----
+## 🤝 Contributing
 
-## Licences & credits
+Bug reports, device test results ("works on my LG C2!"), translations and pull requests are all welcome. Please read the [contributing guide](CONTRIBUTING.md) and the [code of conduct](CODE_OF_CONDUCT.md). For security issues, see [SECURITY.md](SECURITY.md).
 
-LocalFlix is original work. It is not affiliated with or styled on any commercial streaming service's branding. It uses [hls.js](https://github.com/video-dev/hls.js) (Apache-2.0, downloaded at runtime and checksum-verified) and calls [FFmpeg](https://ffmpeg.org) (LGPL/GPL) as an external program. Optional metadata from TMDB: *This product uses the TMDB API but is not endorsed or certified by TMDB.*
+## 📜 License & credits
+
+LocalFlix is released under the **[MIT License](LICENSE)**.
+
+- [hls.js](https://github.com/video-dev/hls.js) (Apache-2.0) is downloaded at runtime and checksum-verified.
+- [FFmpeg](https://ffmpeg.org) (LGPL/GPL) is called as an external program and is not bundled.
+- Optional metadata comes from [TMDB](https://www.themoviedb.org). *This product uses the TMDB API but is not endorsed or certified by TMDB.*
+
+LocalFlix is original work. It is not affiliated with any commercial streaming service. It plays **your own** media; please respect copyright law in your country.
+
+<div align="center"><sub>Made with ❤️ for movie nights at home.</sub></div>

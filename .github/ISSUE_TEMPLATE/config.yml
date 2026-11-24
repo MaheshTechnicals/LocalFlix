@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 🔒 Report a security vulnerability
+    url: https://github.com/MaheshTechnicals/LocalFlix/security/advisories/new
+    about: Please report security problems privately.
+  - name: 📖 Read the FAQ / troubleshooting guide
+    url: https://github.com/MaheshTechnicals/LocalFlix#-faq--troubleshooting
+    about: Most setup and playback questions are answered here.

@@ -81,7 +81,7 @@ if sys.version_info < (3, 10):  # noqa: UP036  # pragma: no cover
 
 # ===== SECTION: constants =====
 APP_NAME = "LocalFlix"
-VERSION = "1.4.1"
+VERSION = "1.4.2"
 SCHEMA_VERSION = 4
 HLSJS_VERSION = "1.7.4"  # resolved from the npm registry on 2026-11-21
 HLSJS_SHA384 = "p9vgU/7IYJWd3I4STrtqxqR/2cAQlhIX7D/HrTnIMEjjcUox165b7se7sxmm3zDg"
@@ -7769,6 +7769,17 @@ class TestHttpHelpers(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_range("bytes=-0", 1000)
 
+    def test_i18n_keys_match(self) -> None:
+        js = WEB_ASSETS["app.js"].decode("utf-8")
+        block = js[js.index("var I18N = {"):]
+        block = block[:block.index("\n};")]
+        langs = re.split(r"\n {1,2}([a-z]{2}(?:-[A-Za-z]+)?): \{", block)[1:]
+        keys = {langs[i]: set(re.findall(r"'([A-Za-z0-9_.]+)':", langs[i + 1])) for i in range(0, len(langs), 2)}
+        self.assertIn("en", keys)
+        for lang, ks in keys.items():
+            self.assertEqual(sorted(keys["en"] - ks), [], f"{lang} is missing keys")
+            self.assertEqual(sorted(ks - keys["en"]), [], f"{lang} has keys that en lacks")
+
     def test_duckdns_names(self) -> None:
         for v, want in (("myflix", "myflix.duckdns.org"), ("https://MyFlix.duckdns.org/", "myflix.duckdns.org"),
                         ("x.myflix.duckdns.org:8000", "myflix.duckdns.org"), ("", ""), ("bad_name!", "")):
@@ -10829,6 +10840,16 @@ PAGES.settings = function (el, r) {
     SET_CATS.map(function (c) { return h('a' + (c === cat ? '.on' : ''), { href: '#/settings/' + c }, t('set.' + c)); }));
   var main = h('section.set-main');
   append(el, [h('div.set', nav, main)]);
+  /* phones: the category bar scrolls sideways and is rebuilt on every switch — keep where the user had scrolled,
+     then make sure the chosen category is visible (it used to jump back to "General") */
+  nav.scrollLeft = S.setNavX || 0;
+  nav.addEventListener('scroll', function () { S.setNavX = nav.scrollLeft; }, { passive: true });
+  var onA = $('a.on', nav);
+  if (onA && nav.scrollWidth > nav.clientWidth) {
+    var l = onA.getBoundingClientRect().left - nav.getBoundingClientRect().left + nav.scrollLeft, r2 = l + onA.offsetWidth;
+    if (l < nav.scrollLeft || r2 > nav.scrollLeft + nav.clientWidth) nav.scrollLeft = l - (nav.clientWidth - onA.offsetWidth) / 2;
+    S.setNavX = nav.scrollLeft;
+  }
   return api('/settings/schema').then(function (d) {
     S.schema = d.settings; S.admin = d.admin;
     main.appendChild(h('h2', t('set.' + cat)));
