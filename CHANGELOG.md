@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.4.0 — 2026-11-24 (fixed address + free HTTPS)
+
+### Added
+- **A fixed address even when the router changes the IP:** set a free DuckDNS name (Settings → Network & Security → *DuckDNS domain* and *token*). LocalFlix checks the LAN IP every 2 minutes and points the name at it. It updates only on a change, plus a 6-hourly keep-alive. The router needs no changes, and nothing is exposed to the internet.
+  - The banner, QR code, TV hint and browser auto-open use the name as soon as it resolves to this device.
+  - The DNS-rebinding guard accepts the name and any name on the HTTPS certificate.
+- **Free trusted HTTPS:** `python3 localflix.py https`. It installs acme.sh after asking, gets a Let's Encrypt certificate for the DuckDNS name with a DNS-01 challenge (no open ports), and saves it in LocalFlix's settings.
+  - The server runs the renewal check itself every day, so no cron is needed and it works on Termux.
+  - A renewed certificate is reloaded without a restart.
+  - `https --off` reverts to plain HTTP.
+- Settings → Network shows the address status (name → IP, or the DuckDNS error), HTTPS validity, and all addresses.
+- `doctor` checks the DuckDNS update and the certificate's remaining days. The banner warns when either needs attention.
+
 ## 1.3.0 — 2026-11-24 (full-source audit)
 
 ### Changed

@@ -176,6 +176,7 @@ python localflix.py doctor [--full|--json]  diagnostics (also in Settings → Ad
 python localflix.py scan [--full]           rescan libraries, then exit
 python localflix.py clear-cache [--all]
 python localflix.py service [print|install|uninstall]   start automatically at login/boot
+python localflix.py https [--domain NAME --token TOKEN] [--yes] [--off]   free trusted HTTPS (DuckDNS + Let's Encrypt)
 python localflix.py version
 python localflix.py --selftest              built-in test suite
 python localflix.py --dump-web DIR          write the embedded web files (edit, then use --dev-web DIR)
@@ -190,6 +191,30 @@ Data locations: Windows `%APPDATA%\LocalFlix` + `%LOCALAPPDATA%\LocalFlix\Cache`
 `python localflix.py service` prints the right file for your OS: a systemd *user* unit (Linux), a launchd agent (macOS), a Startup-folder `.bat` and `schtasks` command (Windows), or a Termux:Boot script. `service install` writes and enables it, and no admin rights are needed.
 
 ---
+
+## A fixed address and free HTTPS (no router changes)
+
+Your router may give the server a different IP every day (`192.168.0.103` today, `.107` tomorrow), which breaks bookmarks and TV shortcuts. LocalFlix can keep a free **DuckDNS** name pointed at whatever IP it has right now. You get one address that never changes, and it is also the name a free, trusted **HTTPS** certificate is issued for.
+
+1. Go to [duckdns.org](https://www.duckdns.org), sign in, add a sub domain (e.g. `myflix`) and copy your **token**.
+2. In LocalFlix, open **Settings → Network & Security** and enter *DuckDNS domain* (`myflix`) and *DuckDNS token*. LocalFlix checks the IP every 2 minutes and updates DuckDNS when it changes. The name only points at your private Wi-Fi address, so nothing becomes reachable from the internet.
+   Every device can now use `http://myflix.duckdns.org:8000`.
+3. **HTTPS (optional):** on the server run
+   ```bash
+   python3 localflix.py https
+   ```
+   This step:
+   - sets up the free [acme.sh](https://github.com/acmesh-official/acme.sh) client (it asks before installing);
+   - proves you own the name through DuckDNS (a DNS check, so no open ports are needed);
+   - gets a Let's Encrypt certificate and saves it for LocalFlix.
+
+   Restart LocalFlix and open `https://myflix.duckdns.org:8000`. You won't see a warning on any device. LocalFlix checks for renewal daily (certificates last 90 days) and loads the new certificate without a restart. Run `python3 localflix.py https --off` to go back to plain HTTP.
+
+Notes:
+- **What it needs:** `openssl` and `curl` (Termux/proot: `apt install openssl curl`). On Windows, run the `https` step inside WSL, or use any ACME client and set the certificate and key paths in Settings.
+- **Router blocks the name:** some routers block names that point at private addresses ("DNS rebinding protection"). If `myflix.duckdns.org` doesn't resolve at home, use the IP address. The phone's own mobile data DNS or a public DNS (8.8.8.8) on the device also works.
+- **Plain IP over HTTPS:** with HTTPS on, the IP addresses still work, but the browser shows a certificate warning for them.
+- **Old TVs:** some TV browsers from before about 2017 don't trust Let's Encrypt. Use the `http://` DuckDNS name on those, which means HTTPS must be off.
 
 ## Firewall fixes
 
@@ -228,7 +253,7 @@ Phones transcode slowly. Prefer MP4/H.264 files, or set *Max streaming quality* 
 
 **Buffering or slow start?** Lower *Max streaming quality* (Settings → Playback), enable hardware acceleration (Settings → Transcoding → *Re-detect*), or use the wired network for the server. Remuxed files (MKV with H.264) start almost instantly. Full transcodes need a reasonably fast CPU or GPU.
 
-**My TV can't open the page.** Type the raw IP address (not `localflix.local`, which many TVs can't resolve). Use `http://`, not `https://`. Check the firewall and that both devices are on the same network, not a guest Wi-Fi.
+**My TV can't open the page.** Type the raw IP address (not `localflix.local`, which many TVs can't resolve). Use `http://`, not `https://`, unless you set up HTTPS (see *A fixed address and free HTTPS*). Check the firewall and that both devices are on the same network, not a guest Wi-Fi.
 
 **A file doesn't show up.** Check that the extension is supported and the file isn't named like a release sample (`sample.mkv`, `*-sample.*`). Then press *Rescan* or run `python localflix.py scan`. Errors appear under Settings → Libraries.
 

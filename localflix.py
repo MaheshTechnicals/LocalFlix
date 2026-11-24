@@ -81,7 +81,7 @@ if sys.version_info < (3, 10):  # noqa: UP036  # pragma: no cover
 
 # ===== SECTION: constants =====
 APP_NAME = "LocalFlix"
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 SCHEMA_VERSION = 4
 HLSJS_VERSION = "1.7.4"  # resolved from the npm registry on 2026-11-21
 HLSJS_SHA384 = "p9vgU/7IYJWd3I4STrtqxqR/2cAQlhIX7D/HrTnIMEjjcUox165b7se7sxmm3zDg"
@@ -951,7 +951,13 @@ SETTINGS_SPEC: list[dict[str, Any]] = [
     S("require_password", False, "bool", "network", admin=True, help="Require a password/PIN to use LocalFlix"),
     S("session_days", 30, "int", "network", admin=True, min=1, max=365, help="Login session length (days)"),
     S("private_only", True, "bool", "network", admin=True, help="Only allow private-network clients"),
-    S("ssl_cert", "", "str", "network", admin=True, restart=True, help="HTTPS certificate path", maxlen=500),
+    S("duckdns_domain", "", "str", "network", admin=True,
+      help="Stable name for this server, e.g. myflix.duckdns.org (free at duckdns.org). LocalFlix keeps it pointed "
+           "at this device's current Wi-Fi IP, so the address never changes", maxlen=80),
+    S("duckdns_token", "", "secret", "network", admin=True, help="DuckDNS token (shown on duckdns.org after login)",
+      maxlen=80),
+    S("ssl_cert", "", "str", "network", admin=True, restart=True,
+      help="HTTPS certificate path (set automatically by: python3 localflix.py https)", maxlen=500),
     S("ssl_key", "", "str", "network", admin=True, restart=True, help="HTTPS key path", maxlen=500),
     S("mdns_name", "localflix", "str", "network", admin=True, restart=True, help="mDNS name (needs zeroconf)",
       maxlen=40),
@@ -5161,6 +5167,106 @@ def _own_names() -> frozenset[str]:
     return _OWN_NAMES[1]
 
 
+DUCKDNS_URL = os.environ.get("LOCALFLIX_DUCKDNS_URL") or "https://www.duckdns.org/update"
+
+
+def duckdns_host(value: Any) -> str:
+    """Normalise what the user typed ("myflix", "myflix.duckdns.org", "https://myflix.duckdns.org/") to
+    ``myflix.duckdns.org`` ('' when it isn't a valid DuckDNS name)."""
+    v = re.sub(r"^[a-z]+://", "", str(value or "").strip().lower()).split("/")[0].split(":")[0].rstrip(".")
+    v = v.removesuffix(".duckdns.org").rsplit(".", 1)[-1]  # a.myflix.duckdns.org → myflix (DuckDNS serves every sub-name of a domain)
+    return f"{v}.duckdns.org" if re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", v) else ""
+
+
+def cert_info(cert: str) -> dict[str, Any]:
+    """DNS names and expiry of a PEM certificate (best effort, stdlib only)."""
+    try:
+        d = ssl._ssl._test_decode_cert(cert)  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001
+        return {"names": [], "expires": 0.0}
+    names = [v.lower() for k, v in d.get("subjectAltName", ()) if k == "DNS"]
+    try:
+        exp = ssl.cert_time_to_seconds(d["notAfter"])
+    except (KeyError, ValueError):
+        exp = 0.0
+    return {"names": names, "expires": exp}
+
+
+class DynDNS:
+    """Keeps ``<name>.duckdns.org`` pointed at this device's current LAN IP (the router may hand out a new one any
+    time), so phones, TVs and bookmarks always use the same address — and an HTTPS certificate for that name stays
+    valid. Checks every 2 minutes; updates DuckDNS only when the IP changed (and every 6 h as a keep-alive)."""
+
+    def __init__(self, app: App) -> None:
+        self.app = app
+        self.ip = ""
+        self.ok = False
+        self.error = ""
+        self.at = 0.0
+        self._host = ""
+        self._wake = threading.Event()
+        self._force = False
+        self._lock = threading.Lock()
+
+    def host(self) -> str:
+        if not self.app.setting("duckdns_token"):
+            return ""
+        return duckdns_host(self.app.setting("duckdns_domain"))
+
+    def current_ip(self) -> str:
+        if self.app.host not in ("0.0.0.0", "::", "", "127.0.0.1", "localhost", "::1"):
+            return self.app.host
+        ips = lan_ips()
+        return ips[0] if ips else ""
+
+    def update(self, force: bool = False) -> bool:
+        with self._lock:
+            host, token = self.host(), str(self.app.setting("duckdns_token") or "")
+            if not host or not token:
+                self.ok, self.error, self._host = False, "", ""
+                return False
+            ip = self.current_ip()
+            if not ip:
+                self.error = "no Wi-Fi/LAN address found"
+                return False
+            if not force and self.ok and ip == self.ip and host == self._host and time.time() - self.at < 6 * 3600:
+                return True
+            url = DUCKDNS_URL + "?" + urllib.parse.urlencode({"domains": host.split(".")[0], "token": token, "ip": ip})
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": f"LocalFlix/{VERSION}"})
+                with urllib.request.urlopen(req, timeout=10) as r:  # fixed https URL
+                    body = r.read(200).decode(errors="replace").strip()
+            except (OSError, ValueError) as e:
+                self.ok, self.error = False, f"DuckDNS not reachable: {getattr(e, 'reason', e)}"[:200]
+                log.warning("%s", self.error)
+                return False
+            if not body.startswith("OK"):
+                self.ok, self.error = False, "DuckDNS refused the update — check the domain name and token"
+                log.warning("DuckDNS: update for %s refused (%s)", host, body[:20])
+                return False
+            if ip != self.ip or host != self._host:
+                log.info("DuckDNS: %s → %s", host, ip)
+            self.ip, self.ok, self.error, self.at, self._host = ip, True, "", time.time(), host
+            return True
+
+    def kick(self) -> None:
+        self._force = True
+        self._wake.set()
+
+    def loop(self) -> None:
+        while not self.app.stopping.is_set():
+            force, self._force = self._force, False
+            with contextlib.suppress(Exception):
+                self.update(force)
+            self._wake.wait(120)
+            self._wake.clear()
+
+    def status(self) -> dict[str, Any]:
+        host = self.host()
+        return {"enabled": bool(host), "host": host, "ip": self.ip, "ok": self.ok and host == self._host,
+                "error": self.error, "updatedAt": self.at or None}
+
+
 def host_allowed(host_hdr: str | None, app: App) -> bool:
     """DNS-rebinding guard: accept IP literals, localhost names, this machine's names and the mDNS name."""
     if not host_hdr:
@@ -5179,6 +5285,8 @@ def host_allowed(host_hdr: str | None, app: App) -> bool:
     if h == "localhost" or h.endswith(".localhost"):
         return True
     names = set(_own_names())
+    if h in app.public_names():  # the DuckDNS name / names on the HTTPS certificate
+        return True
     mdns = str(app.setting("mdns_name") or "localflix").lower()
     names |= {f"{n}.local" for n in list(names)} | {f"{mdns}.local", mdns}
     return h in names
@@ -5654,6 +5762,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "ffmpeg": {"available": app.ff.available, "version": app.ff.version, "path": app.ff.ffmpeg,
                            "hw": app.ff.pick_hw(str(app.setting("hwaccel"))), "hwResults": app.ff.hw_results},
                 "urls": app.urls(), "port": app.port, "uptime": int(time.time() - START_TIME),
+                "duckdns": app.dyndns.status(), "https": {"on": app.tls, "names": app.tls_names,
+                                                          "expires": app.tls_expires or None},
                 "hlsjs": {"version": HLSJS_VERSION, "cached": (app.paths.vendor / "hls.min.js").exists()},
                 "qr": True, "admin": self.is_admin(), "scan": app.scanner.status,
                 "profilesEnabled": bool(app.setting("profiles_enabled")),
@@ -6838,6 +6948,19 @@ def run_doctor(app: App | None, quick: bool = True, paths: Paths | None = None) 
         opt["chardet"] = False
     add("Optional libraries", "ok", ", ".join(f"{k}: {'yes' if v else 'no'}" for k, v in opt.items()),
         "Optional: pip install segno zeroconf")
+    if app is not None:
+        h = app.dyndns.host()
+        if h:
+            ok = app.dyndns.update(force=True)
+            add("Stable address (DuckDNS)", "ok" if ok else "warn", f"{h} → {app.dyndns.ip or '?'}",
+                "" if ok else (app.dyndns.error or "check domain/token in Settings → Network"))
+        cert = str(app.setting("ssl_cert") or "")
+        if cert:
+            ci = cert_info(cert)
+            days = int((ci["expires"] - time.time()) / 86400) if ci["expires"] else -1
+            add("HTTPS certificate", "ok" if days > 14 else "warn" if days >= 0 else "fail",
+                f"{', '.join(ci['names']) or cert} — {days} days left" if days >= 0 else f"{cert} unreadable",
+                "" if days > 14 else "Run: python3 localflix.py https")
     return checks
 
 
@@ -6870,12 +6993,17 @@ class App:
         self.tmdb = Tmdb(self)
         self.hls = HlsManager(self)
         self.auth = Auth(self)
+        self.dyndns = DynDNS(self)
         self.stopping = threading.Event()
         self.dev_web = dev_web
         self.httpd: Server | None = None
         self.port = 8000
         self.host = "0.0.0.0"
         self.tls = False
+        self.tls_ctx: ssl.SSLContext | None = None
+        self.tls_files: tuple[str, str, float] | None = None
+        self.tls_names: list[str] = []
+        self.tls_expires = 0.0
         self._sub_locks: dict[str, threading.Lock] = collections.defaultdict(threading.Lock)
         self._asset_v: dict[str, str] | None = None
         self._zc: Any = None
@@ -6901,6 +7029,8 @@ class App:
                     h.setLevel(getattr(logging, str(changed["log_level"]), logging.INFO))
         if "prevent_sleep" in changed:
             self.sleep.enabled = bool(changed["prevent_sleep"])
+        if "duckdns_domain" in changed or "duckdns_token" in changed:
+            self.dyndns.kick()
         if "ffmpeg_path" in changed or "ffprobe_path" in changed:
             self.ff = FFmpeg(self.paths, str(self.setting("ffmpeg_path") or ""), str(self.setting("ffprobe_path") or ""))
             self.ff.detect_hw(self.db)
@@ -6932,13 +7062,31 @@ class App:
             self._own_ips, self._own_ips_at = ips, now
         return ip.split("%")[0].replace("::ffff:", "") in self._own_ips
 
+    def public_names(self) -> set[str]:
+        """Host names that reach this server besides its IPs: the DuckDNS name and the certificate's names."""
+        names = set(self.tls_names)
+        h = self.dyndns.host()
+        if h:
+            names.add(h)
+        return names
+
+    def public_url(self) -> str:
+        """``https://myflix.duckdns.org:8000`` when the DuckDNS name is set up and currently points here."""
+        h = self.dyndns.host()
+        if not h or not self.dyndns.ok or self.host in ("127.0.0.1", "localhost", "::1"):
+            return ""
+        scheme = "https" if self.tls else "http"
+        default = 443 if self.tls else 80
+        return f"{scheme}://{h}" + ("" if self.port == default else f":{self.port}")
+
     def urls(self) -> list[str]:
         scheme = "https" if self.tls else "http"
         if self.host in ("127.0.0.1", "localhost", "::1"):
             return [f"{scheme}://localhost:{self.port}"]
+        pub = [self.public_url()] if self.public_url() else []
         if self.host not in ("0.0.0.0", "::", ""):
-            return [f"{scheme}://{self.host}:{self.port}"]
-        return [f"{scheme}://{ip}:{self.port}" for ip in lan_ips()] or [f"{scheme}://localhost:{self.port}"]
+            return pub + [f"{scheme}://{self.host}:{self.port}"]
+        return pub + [f"{scheme}://{ip}:{self.port}" for ip in lan_ips()] or [f"{scheme}://localhost:{self.port}"]
 
     # --- subtitles ----------------------------------------------------------------
     def subtitle_vtt(self, iid: str, sidx: int) -> str:
@@ -7027,6 +7175,24 @@ class App:
                 self.db.backup_watch_state()
                 self.auth.cleanup()
         threading.Thread(target=nightly, name="backup", daemon=True).start()
+        threading.Thread(target=self.dyndns.loop, name="duckdns", daemon=True).start()
+
+        def certs() -> None:
+            # renew the Let's Encrypt certificate set up by `localflix.py https` (no cron needed, works on Termux)
+            # and hot-reload whatever certificate file changed on disk
+            last_renew = 0.0
+            while not self.stopping.wait(1800):
+                acme_home = self.db.kv_get("acme_home")
+                if acme_home and time.time() - last_renew > 86400:
+                    last_renew = time.time()
+                    acme = Path(acme_home) / "acme.sh"
+                    if acme.exists():
+                        rc, _out, err = run_capture([str(acme), "--cron", "--home", acme_home], timeout=900,
+                                                    low_priority=True)
+                        if rc not in (0, 2):
+                            log.warning("Certificate renewal check failed (%s): %s", rc, err.decode(errors="replace")[-200:])
+                self.reload_tls()
+        threading.Thread(target=certs, name="certs", daemon=True).start()
 
     def bind(self, host: str, port: int) -> None:
         last: OSError | None = None
@@ -7050,6 +7216,29 @@ class App:
         ctx.load_cert_chain(cert, key)
         self.httpd.socket = ctx.wrap_socket(self.httpd.socket, server_side=True, do_handshake_on_connect=False)
         self.tls = True
+        self.tls_ctx = ctx
+        self.tls_files = (cert, key, os.path.getmtime(cert))
+        ci = cert_info(cert)
+        self.tls_names, self.tls_expires = ci["names"], ci["expires"]
+
+    def reload_tls(self) -> bool:
+        """Pick up a renewed certificate without a restart (new connections use it)."""
+        if self.tls_ctx is None or self.tls_files is None:
+            return False
+        cert, key, mt = self.tls_files
+        try:
+            now_mt = os.path.getmtime(cert)
+            if now_mt == mt:
+                return False
+            self.tls_ctx.load_cert_chain(cert, key)
+        except (OSError, ssl.SSLError) as e:
+            log.warning("HTTPS certificate reload failed: %s", e)
+            return False
+        self.tls_files = (cert, key, now_mt)
+        ci = cert_info(cert)
+        self.tls_names, self.tls_expires = ci["names"], ci["expires"]
+        log.info("HTTPS certificate reloaded (valid until %s)", time.strftime("%Y-%m-%d", time.localtime(self.tls_expires)))
+        return True
 
     def advertise_mdns(self) -> None:
         if zeroconf is None or self.host in ("127.0.0.1", "localhost"):
@@ -7137,6 +7326,11 @@ def print_banner(app: App) -> None:
     say("On a TV: open the TV's web browser and type", "bold")
     if urls:
         print(f"    {c(urls[0] + '/tv', 'cyan')}")
+    ds = app.dyndns.status()
+    if ds["enabled"] and not ds["ok"]:
+        say(f"⚠  {ds['host']}: {ds['error'] or 'not updated yet'} (Settings → Network)", "yellow", hang=3)
+    if app.tls and app.tls_expires and app.tls_expires - time.time() < 14 * 86400:
+        say("⚠  HTTPS certificate expires soon — run: python3 localflix.py https", "yellow", hang=3)
     if not app.setting("require_password") and app.host in ("0.0.0.0", "::"):
         say("⚠  No password set — anyone on your Wi-Fi can watch. (Settings → Network & Security)", "yellow", hang=3)
     if PLAT.is_windows:
@@ -7509,6 +7703,11 @@ class TestHttpHelpers(unittest.TestCase):
             parse_range("bytes=50-10", 1000)
         with self.assertRaises(ValueError):
             parse_range("bytes=-0", 1000)
+
+    def test_duckdns_names(self) -> None:
+        for v, want in (("myflix", "myflix.duckdns.org"), ("https://MyFlix.duckdns.org/", "myflix.duckdns.org"),
+                        ("x.myflix.duckdns.org:8000", "myflix.duckdns.org"), ("", ""), ("bad_name!", "")):
+            self.assertEqual(duckdns_host(v), want, v)
 
     def test_qr(self) -> None:
         m = QRGEN.matrix("http://192.168.1.20:8000")
@@ -8176,10 +8375,146 @@ def build_parser() -> argparse.ArgumentParser:
     sv = sub.add_parser("service", help="autostart helpers")
     sv.add_argument("action", nargs="?", default="print", choices=["print", "install", "uninstall"])
     sub.add_parser("version", help="print version")
+    hs = sub.add_parser("https", help="free trusted HTTPS: DuckDNS name + Let's Encrypt certificate (acme.sh)")
+    hs.add_argument("--domain", help="your DuckDNS name, e.g. myflix or myflix.duckdns.org")
+    hs.add_argument("--token", help="your DuckDNS token")
+    hs.add_argument("--yes", action="store_true", help="don't ask before installing acme.sh")
+    hs.add_argument("--off", action="store_true", help="turn HTTPS off again")
     fx = sub.add_parser("fixtures", help="generate test media with ffmpeg")
     fx.add_argument("dir")
     fx.add_argument("--small", action="store_true")
     return p
+
+
+ACME_TARBALL = "https://github.com/acmesh-official/acme.sh/archive/refs/heads/master.tar.gz"
+
+
+def find_acme() -> Path | None:
+    for cand in (Path.home() / ".acme.sh" / "acme.sh", Path(shutil.which("acme.sh") or "")):
+        if cand.name == "acme.sh" and cand.is_file():
+            return cand
+    return None
+
+
+def install_acme(home: Path) -> Path | None:
+    """Download acme.sh (the free Let's Encrypt client, a shell script) and install it into ``home``.
+    No cron job: LocalFlix runs the renewal check itself every day."""
+    import tarfile
+    print(c("  Downloading acme.sh …", "dim"))
+    with tempfile.TemporaryDirectory() as td:
+        tgz = Path(td) / "acme.tar.gz"
+        try:
+            with urllib.request.urlopen(ACME_TARBALL, timeout=60) as r:  # fixed https URL
+                tgz.write_bytes(r.read())
+            with tarfile.open(tgz) as t:
+                for m in t.getmembers():  # never write outside the temp folder
+                    if m.name.startswith("/") or ".." in Path(m.name).parts or m.issym() or m.islnk():
+                        raise ValueError(f"unsafe path in archive: {m.name}")
+                t.extractall(td)  # members checked above
+        except (OSError, ValueError, tarfile.TarError) as e:
+            print(c(f"  Download failed: {e}", "red"))
+            return None
+        src = next((d for d in Path(td).iterdir() if d.is_dir() and (d / "acme.sh").exists()), None)
+        if src is None:
+            print(c("  Unexpected archive layout", "red"))
+            return None
+        rc = subprocess.call(["sh", "acme.sh", "--install", "--nocron", "--home", str(home)], cwd=src)
+    acme = home / "acme.sh"
+    return acme if rc == 0 and acme.exists() else None
+
+
+def cmd_https(args: argparse.Namespace, paths: Paths) -> int:
+    """Free, trusted HTTPS with no router changes:
+    1. a DuckDNS name that LocalFlix keeps pointed at this device's (changing) LAN IP;
+    2. a Let's Encrypt certificate for that name via a DNS challenge (acme.sh + DuckDNS API) — no open ports;
+    3. LocalFlix serves HTTPS with it, renews it daily-checked and reloads it without a restart."""
+    app = App(paths)
+    db = app.db
+    if args.off:
+        db.set_setting("ssl_cert", "")
+        db.set_setting("ssl_key", "")
+        db.x("DELETE FROM kv WHERE key IN ('acme_home','acme_domain')")
+        print("HTTPS turned off. Restart LocalFlix; it will use http:// again.")
+        return 0
+    if PLAT.is_windows:
+        print("On Windows, run this inside WSL (Ubuntu), or get a certificate with win-acme / Certbot and set")
+        print("Settings → Network → HTTPS certificate/key. The DuckDNS name itself works on Windows too.")
+        return 1
+    interactive = sys.stdin.isatty()
+    domain = args.domain or str(app.setting("duckdns_domain") or "")
+    if not domain and interactive:
+        print("Create a free name at https://www.duckdns.org (log in, add a sub domain, copy the token).")
+        domain = _ask("DuckDNS name (e.g. myflix)")
+    host = duckdns_host(domain)
+    if not host:
+        print(c("A DuckDNS name is needed, e.g. --domain myflix", "red"))
+        return 1
+    token = args.token or str(app.setting("duckdns_token") or "")
+    if not token and interactive:
+        import getpass
+        token = getpass.getpass("  DuckDNS token (hidden): ").strip()
+    if not token:
+        print(c("The DuckDNS token is needed (--token …)", "red"))
+        return 1
+    db.set_setting("duckdns_domain", host)
+    db.set_setting("duckdns_token", token)
+    app.invalidate_settings()
+    print(f"  1/3  Pointing {c(host, 'cyan')} at this device …", end=" ", flush=True)
+    if not app.dyndns.update(force=True):
+        print(c("failed", "red"))
+        print(f"       {app.dyndns.error}")
+        return 1
+    print(c(f"ok ({app.dyndns.ip})", "green"))
+    missing = [t for t in ("openssl",) if not shutil.which(t)]
+    if not (shutil.which("curl") or shutil.which("wget")):
+        missing.append("curl")
+    if missing:
+        root = hasattr(os, "geteuid") and os.geteuid() == 0
+        pm = "pkg" if PLAT.is_termux and "com.termux" in sys.prefix else ("brew" if PLAT.is_mac else
+                                                                          "apt" if root else "sudo apt")
+        print(c(f"  Missing tools: {', '.join(missing)}. Install them first:  {pm} install {' '.join(missing)}", "yellow"))
+        return 1
+    acme = find_acme()
+    if acme is None:
+        home = Path.home() / ".acme.sh"
+        print("  acme.sh (free, open-source Let's Encrypt client) is needed to get the certificate.")
+        if not args.yes and not (interactive and _yes(f"Install it into {home}?")):
+            print("  Cancelled. Install it yourself (https://github.com/acmesh-official/acme.sh) and run this again.")
+            return 1
+        acme = install_acme(home)
+        if acme is None:
+            print(c("  acme.sh could not be installed.", "red"))
+            return 1
+    acme_home = str(acme.parent)
+    env = dict(os.environ, DuckDNS_Token=token)
+    print(f"  2/3  Requesting a Let's Encrypt certificate for {host} (DNS check, takes ~1–2 minutes) …")
+    rc = subprocess.call([str(acme), "--home", acme_home, "--issue", "--dns", "dns_duckdns", "-d", host,
+                          "--server", "letsencrypt", "--keylength", "ec-256", "--dnssleep", "60"], env=env)
+    if rc not in (0, 2):  # 2 = a still-valid certificate already exists
+        print(c(f"  Certificate request failed (acme.sh exit code {rc}). See the messages above.", "red"))
+        return 1
+    tls_dir = paths.config / "tls"
+    tls_dir.mkdir(parents=True, exist_ok=True)
+    cert, key = tls_dir / "cert.pem", tls_dir / "key.pem"
+    print("  3/3  Installing the certificate for LocalFlix …")
+    rc = subprocess.call([str(acme), "--home", acme_home, "--install-cert", "-d", host, "--ecc",
+                          "--key-file", str(key), "--fullchain-file", str(cert)], env=env)
+    if rc != 0 or not cert.exists() or not key.exists():
+        print(c(f"  Installing the certificate failed (exit code {rc}).", "red"))
+        return 1
+    with contextlib.suppress(OSError):
+        os.chmod(key, 0o600)
+    db.set_setting("ssl_cert", str(cert))
+    db.set_setting("ssl_key", str(key))
+    db.kv_set("acme_home", acme_home)
+    db.kv_set("acme_domain", host)
+    port = int(app.setting("port") or 8000)
+    print()
+    print(c("  ✓ HTTPS is ready.", "green") + " Restart LocalFlix, then open on every device:")
+    print(f"      {c(f'https://{host}' + ('' if port == 443 else f':{port}'), 'cyan')}")
+    print(c("    The certificate renews itself; the name follows this device's IP automatically.", "dim"))
+    db.close_all()
+    return 0
 
 
 def _can_open_browser() -> bool:
@@ -8271,6 +8606,8 @@ def cmd_serve(args: argparse.Namespace, paths: Paths) -> int:
         if sig is not None:
             with contextlib.suppress(ValueError, OSError):
                 signal.signal(sig, on_signal)
+    if app.dyndns.host():
+        app.dyndns.update(force=True)  # so the banner / QR / auto-open can use the stable name right away
     app.start_background()
     app.advertise_mdns()
     print_banner(app)
@@ -8382,6 +8719,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if cmd == "service":
         return run_service(args.action, paths)
+    if cmd == "https":
+        return cmd_https(args, paths)
     if cmd == "fixtures":
         made = make_fixtures(FFmpeg(paths), Path(args.dir), small=args.small)
         print("\n".join(str(m) for m in made))
@@ -9223,6 +9562,10 @@ var I18N = {
   'scope.common': 'Common video folders', 'scope.common.d': 'Videos, Movies and Downloads (phone storage on Android) plus USB drives and SD cards as they are plugged in.',
   'scope.all': 'Entire device', 'scope.all.d': 'Every video on this computer: home folder and all drives. System and app folders are skipped. The first scan can take a while.',
   'scope.warn': 'Everyone who can open LocalFlix on your network will see these videos. Consider setting a password.', 'scope.found': 'Detected folders',
+  'net.title': 'Address & HTTPS', 'net.dns.ok': 'Stable address: {0} → {1}', 'net.dns.err': '{0}: {1}',
+  'net.dns.off': 'Your Wi-Fi IP can change. Add a free DuckDNS name below (duckdns.org) and LocalFlix keeps it pointed at this device — bookmarks and TVs keep working.',
+  'net.https.on': 'HTTPS on — certificate valid until {0}', 'net.https.off': 'Free trusted HTTPS: on the server run  python3 localflix.py https  (needs the DuckDNS name), then restart.',
+  'net.urls': 'Open LocalFlix at',
   'scope.none': 'No folders detected on this device', 'lib.auto': 'Auto', 'lib.custom': 'Custom', 'lib.offline': 'Not connected', 'lib.inside': 'inside {0}',
   'lib.hide': 'Hide', 'empty.common': 'Use my video folders', 'empty.all': 'Find every video on this device',
   'set.refreshmeta': 'Refresh metadata', 'set.licenses': 'Licences', 'set.unsaved': 'Not admin — changes are disabled',
@@ -9278,6 +9621,10 @@ var I18N = {
   'scope.common': 'सामान्य वीडियो फ़ोल्डर', 'scope.common.d': 'Videos, Movies और Downloads (Android पर फ़ोन स्टोरेज) और लगाए गए USB ड्राइव व SD कार्ड।',
   'scope.all': 'पूरा डिवाइस', 'scope.all.d': 'इस कंप्यूटर के सभी वीडियो: होम फ़ोल्डर और सभी ड्राइव। सिस्टम और ऐप फ़ोल्डर छोड़ दिए जाते हैं। पहला स्कैन समय ले सकता है।',
   'scope.warn': 'आपके नेटवर्क पर LocalFlix खोलने वाला हर व्यक्ति ये वीडियो देख सकेगा। पासवर्ड सेट करने पर विचार करें।', 'scope.found': 'मिले हुए फ़ोल्डर',
+  'net.title': 'पता और HTTPS', 'net.dns.ok': 'स्थायी पता: {0} → {1}', 'net.dns.err': '{0}: {1}',
+  'net.dns.off': 'आपका Wi-Fi IP बदल सकता है। नीचे एक मुफ़्त DuckDNS नाम (duckdns.org) जोड़ें — LocalFlix उसे इसी डिवाइस पर रखेगा, बुकमार्क और टीवी चलते रहेंगे।',
+  'net.https.on': 'HTTPS चालू — सर्टिफ़िकेट {0} तक मान्य', 'net.https.off': 'मुफ़्त भरोसेमंद HTTPS: सर्वर पर  python3 localflix.py https  चलाएँ (DuckDNS नाम ज़रूरी), फिर रीस्टार्ट करें।',
+  'net.urls': 'LocalFlix यहाँ खोलें',
   'scope.none': 'इस डिवाइस पर कोई फ़ोल्डर नहीं मिला', 'lib.auto': 'ऑटो', 'lib.custom': 'कस्टम', 'lib.offline': 'जुड़ा नहीं है', 'lib.inside': '{0} के अंदर',
   'lib.hide': 'छिपाएँ', 'empty.common': 'मेरे वीडियो फ़ोल्डर इस्तेमाल करें', 'empty.all': 'इस डिवाइस के सभी वीडियो खोजें',
   'set.refreshmeta': 'मेटाडेटा ताज़ा करें', 'set.licenses': 'लाइसेंस', 'set.unsaved': 'एडमिन नहीं — बदलाव अक्षम हैं',
@@ -10329,7 +10676,7 @@ var CHOICE_LABELS = {
   bind: { lan: 'LAN', localhost: 'Localhost only' }, max_quality: { auto: 'Auto', original: 'Original', '2160p': '4K · 20 Mbps', '1080p': '1080p · 8 Mbps', '720p': '720p · 4 Mbps', '480p': '480p · 1.5 Mbps', '360p': '360p · 0.8 Mbps' },
   library_mode: { auto: 'Movies & Shows', videos: 'Videos only' }
 };
-function labelFor(key) { return key.replace(/_/g, ' ').replace(/\b\w/, function (c) { return c.toUpperCase(); }); }
+function labelFor(key) { return key.replace(/_/g, ' ').replace(/\b\w/, function (c) { return c.toUpperCase(); }).replace(/^Duckdns/, 'DuckDNS').replace(/^Ssl/, 'SSL'); }
 function saveSetting(key, val, spec) {
   var body = {}; body[key] = val;
   return api('/settings' + (spec.scope === 'server' ? '?scope=server' : ''), { method: 'PUT', body: { values: body } }).then(function (d) {
@@ -10417,6 +10764,20 @@ PAGES.settings = function (el, r) {
     if (extra && extra.after) main.appendChild(extra.after());
   });
 };
+function netStatusCard(urls) {
+  var list = h('div', { style: { marginTop: '.5em' } }, (urls || []).map(function (u) { return h('div', h('code', u)); }));
+  var box = h('div.card-box', h('b', t('set.urls')), list);
+  api('/system/info').then(function (i) {
+    var d = i.duckdns || {}, hs = i.https || {};
+    var line = function (txt, good) { box.appendChild(h('p' + (good ? '' : '.muted'), { style: { margin: '.6em 0 0', overflowWrap: 'anywhere', color: good ? 'var(--ok)' : '' } }, txt)); };
+    if (d.enabled && d.ok) line('✓ ' + t('net.dns.ok', d.host, d.ip), true);
+    else if (d.enabled) line('⚠️ ' + t('net.dns.err', d.host, d.error || '…'));
+    else line(t('net.dns.off'));
+    line(hs.on ? '🔒 ' + t('net.https.on', hs.expires ? new Date(hs.expires * 1000).toLocaleDateString() : '?') : t('net.https.off'), hs.on);
+    if (i.urls && i.urls.length) { clear(list); i.urls.forEach(function (u) { list.appendChild(h('div', h('code', u))); }); }
+  }).catch(function () { /* admin only */ });
+  return box;
+}
 var SET_EXTRA = {
   subtitles: { before: function () {
     var p = h('div.sub-prev#subprev', h('div.subs', h('span.cue', t('set.preview'))));
@@ -10482,7 +10843,7 @@ var SET_EXTRA = {
   network: { before: function () {
     var box = h('div');
     var urls = (S.info && S.info.urls) || [];
-    box.appendChild(h('div.card-box', h('b', t('set.urls')), urls.map(function (u) { return h('div', h('code', u)); })));
+    box.appendChild(netStatusCard(urls));
     if (S.info && S.info.openSecurity) box.appendChild(h('div.banner', { style: { margin: '0 0 1em' } }, '⚠️ ' + t('set.open')));
     if (!S.admin) return box;
     var pw = h('input.input', { type: 'password', placeholder: t('set.password'), autocomplete: 'new-password' });
