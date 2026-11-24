@@ -5,6 +5,7 @@ All notable changes to LocalFlix are listed here. Versions follow [semantic vers
 ## 1.4.2 — 2026-11-24 (open-source release)
 
 ### Fixed
+- **Windows: on-demand streaming never started** ("Preparing stream…" then an error). ffmpeg's HLS muxer finds the folder for the fMP4 init segment by searching the playlist path for `/` only. With Windows `\` paths it wrote `init_*.mp4` into the current directory, so the server waited for it in vain. Output paths now use forward slashes. CI on Windows was failing for this reason and is green again.
 - **Settings on phones:** the category bar scrolls sideways. Tapping a category further along (e.g. *Network & Security*) opened the page but scrolled the bar back to *General*. The bar now keeps its position and keeps the selected category in view.
 
 ### Added

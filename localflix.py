@@ -267,6 +267,12 @@ def default_media_dir() -> Path:
     return SCRIPT_DIR / "output"
 
 
+def ff_out(p: Path) -> str:
+    """Output path for ffmpeg's HLS muxer. Always forward slashes: the muxer finds the folder for the fMP4 init
+    segment by searching for '/' only, so with Windows backslashes it wrote init_*.mp4 into the current directory."""
+    return Path(p).as_posix()
+
+
 def long_path(p: Path) -> str:
     """Return a path string usable on Windows even beyond MAX_PATH (``\\\\?\\`` prefix)."""
     s = str(p)
@@ -4213,9 +4219,9 @@ class HlsSession:
     def _hls_out(self, outdir: Path, prefix: str, start_number: int, hls_time: float, init_name: str) -> list[str]:
         return ["-f", "hls", "-hls_time", f"{hls_time:g}", "-hls_segment_type", "fmp4",
                 "-hls_fmp4_init_filename", init_name, "-start_number", str(start_number),
-                "-hls_segment_filename", str(outdir / f"{prefix}_%06d.m4s"),
+                "-hls_segment_filename", ff_out(outdir / f"{prefix}_%06d.m4s"),
                 "-hls_flags", "+independent_segments+temp_file", "-hls_list_size", "0",
-                "-hls_segment_options", "movflags=+frag_discont", str(outdir / f"{prefix}.m3u8")]
+                "-hls_segment_options", "movflags=+frag_discont", ff_out(outdir / f"{prefix}.m3u8")]
 
     def video_filters(self, sw: bool) -> tuple[list[str], str, list[str]]:
         """Return (input args, filter chain or filter_complex, encoder args)."""
@@ -4361,10 +4367,10 @@ class HlsSession:
                  "-hls_flags", "+independent_segments+temp_file"]
         if self.fmp4:
             args += ["-hls_segment_type", "fmp4", "-hls_fmp4_init_filename", "s_init.mp4",
-                     "-hls_segment_filename", str(outdir / "s_%05d.m4s")]
+                     "-hls_segment_filename", ff_out(outdir / "s_%05d.m4s")]
         else:
-            args += ["-hls_segment_type", "mpegts", "-hls_segment_filename", str(outdir / "s_%05d.ts")]
-        args.append(str(outdir / "stream.m3u8"))
+            args += ["-hls_segment_type", "mpegts", "-hls_segment_filename", ff_out(outdir / "s_%05d.ts")]
+        args.append(ff_out(outdir / "stream.m3u8"))
         return args
 
     # --- job control --------------------------------------------------------
@@ -8040,6 +8046,10 @@ class TestServerAPI(unittest.TestCase):
     def tearDownClass(cls) -> None:
         cls.app.stop()
         cls.app.db.close_all()
+        for h in list(log.handlers):  # Windows can't delete a log file that is still open
+            if isinstance(h, logging.FileHandler):
+                log.removeHandler(h)
+                h.close()
         time.sleep(0.3)
         cls.tmp.cleanup()
 
