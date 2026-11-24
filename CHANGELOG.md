@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.2.4 — 2026-11-24
+
+### Fixed
+- **`StopIteration` 500 error on HLS segment requests (seen on Termux/Android):** the segment server checked whether all files of a segment existed. When they didn't, it scanned for the first missing one, but on slow devices ffmpeg could finish writing it between the two checks. The scan then found nothing and crashed the request. It now loops round and serves the segment.
+
 ## 1.2.3 — 2026-11-24
 
 ### Fixed

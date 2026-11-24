@@ -80,7 +80,7 @@ if sys.version_info < (3, 10):  # noqa: UP036  # pragma: no cover
 
 # ===== SECTION: constants =====
 APP_NAME = "LocalFlix"
-VERSION = "1.2.3"
+VERSION = "1.2.4"
 SCHEMA_VERSION = 4
 HLSJS_VERSION = "1.7.4"  # resolved from the npm registry on 2026-11-21
 HLSJS_SHA384 = "p9vgU/7IYJWd3I4STrtqxqR/2cAQlhIX7D/HrTnIMEjjcUox165b7se7sxmm3zDg"
@@ -4306,7 +4306,11 @@ class HlsSession:
             ahead = lookahead * 3 if rendition == "video" and self.video_mode == "copy" else lookahead
             with self.lock:
                 job = self.jobs.get(rendition)
-                missing = next(u for u, f in zip(range(a, b), files) if not f.exists())
+                # ffmpeg may finish writing the last file between the all-exist check above and this scan
+                # (common on slow phones): nothing is missing any more, so loop round and serve it
+                missing = next((u for u, f in zip(range(a, b), files) if not f.exists()), None)
+                if missing is None:
+                    continue
                 restart = job is None or missing < job.start_seg or missing <= job.head or \
                     (job.finished and job.head < missing) or \
                     missing > max(job.head, job.start_seg) + max(2, ahead)
@@ -7570,7 +7574,7 @@ class TestServerAPI(unittest.TestCase):
         st, _, d = self.req("/api/v1/items?type=series")
         self.assertEqual(st, 200)
         if self.has_ff:
-            show = next(x for x in d["items"] if x["title"] == "Show")
+            show = next((x for x in d["items"] if x["title"] == "Show"), {})
             st, _, s = self.req(f"/api/v1/series/{show['id']}")
             self.assertEqual(len(s["episodes"]), 3)
             st, _, sr = self.req("/api/v1/search?q=multi")
