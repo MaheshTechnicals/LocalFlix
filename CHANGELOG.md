@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.2.2 — 2026-11-24 (playback hangs, TV remote, browser launch)
+
+### Fixed — videos stuck at "Preparing stream… 99 %"
+- **Root cause:** audio tracks were stream-copied after a seek or resume. A copied track starts at the container's seek point (an earlier video keyframe) instead of the requested time, so its timestamps were off by up to the GOP length (measured: 0.02 s or 20.8 s where 30 s was expected). The player then waited forever for audio at the play position while ffmpeg kept encoding, hence "99 %". MPEG-TS files (ADTS AAC) additionally failed with `fragParsingError`. Audio renditions are now always re-encoded (AAC; AC3/E-AC3 when passthrough is enabled), which is cheap and sample-accurate. Measured on 11 problem files: every one now starts in about 2 s from 0:00 and from a resume point (TS-AAC and long-GOP files used to hang).
+- Late-starting audio is padded with silence, so playback starts at 0:00 instead of skipping ahead.
+- Video playlists end where the video stream ends: files whose audio is longer than the video got an empty last segment and stalled at the very end, which also blocked auto-next.
+- The real video stream is always used: `V:0` / its exact index, never embedded cover art.
+- **Stall watchdog:** if nothing plays for 25 s (45 s when transcoding), the player switches to the next safer method (direct → remux → transcode) or shows the error screen with Retry and Try transcoding. The progress text says "Buffering…" instead of sitting at "99 %".
+
+### Fixed — TV remote
+- OK now activates the focused item on key press, for every control. Previously cards opened only on key release, after a long-press timer, and some TV browsers (Samsung/LG) never send key release, so OK did nothing or opened a small menu. More OK key codes are supported: `Select`, `Accept`, Android `DPAD_CENTER` (23), Samsung legacy (29443). OK with nothing focused now focuses the first item.
+- Arrow navigation no longer jumps into a different row: Right from the player's volume button went to the seek bar instead of continuing along the controls. The same rule applies on every page.
+- Search on TV starts on the on-screen keyboard.
+- The mouse cursor is hidden only while the remote's arrow keys are in use, so LG Magic Remote pointing still works.
+- Whole flow verified with keys only: profile → home → rows → details → play/pause/seek → control bar → ⚙ menus → Back × n → TV Shows → series → episode → search keyboard → settings toggles.
+
+### Changed
+- On start, the server opens the device's own browser at its **LAN address**, straight to the home page (`http://<lan-ip>:<port>/#/home`). Windows/macOS/Linux use the default browser, WSL uses the Windows browser, and Termux (also inside proot-distro) uses Termux's URL opener. Headless servers and Docker skip it. That machine keeps admin rights even though it doesn't connect over loopback.
+
 ## 1.2.1 — 2026-11-24 (phone polish & faster start)
 
 ### Fixed

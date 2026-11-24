@@ -80,7 +80,7 @@ if sys.version_info < (3, 10):  # noqa: UP036  # pragma: no cover
 
 # ===== SECTION: constants =====
 APP_NAME = "LocalFlix"
-VERSION = "1.2.1"
+VERSION = "1.2.2"
 SCHEMA_VERSION = 4
 HLSJS_VERSION = "1.7.4"  # resolved from the npm registry on 2026-11-21
 HLSJS_SHA384 = "p9vgU/7IYJWd3I4STrtqxqR/2cAQlhIX7D/HrTnIMEjjcUox165b7se7sxmm3zDg"
@@ -1672,6 +1672,29 @@ def probe_file(ff: FFmpeg, path: Path, timeout: float = 120) -> dict[str, Any]:
     return normalise_probe(json.loads(out.decode("utf-8", errors="replace") or "{}"), path)
 
 
+def _stream_duration(st: dict[str, Any]) -> float:
+    """A stream's own duration (MKV keeps it in the DURATION tag as HH:MM:SS.nnnnnnnnn)."""
+    d = _frac(st.get("duration"))
+    if d > 0:
+        return d
+    tag = next((v for k, v in (st.get("tags") or {}).items() if k.upper().startswith("DURATION")), "")
+    m = re.match(r"(\d+):(\d+):(\d+(?:\.\d+)?)", str(tag))
+    return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3)) if m else 0.0
+
+
+def video_stream_duration(ff: FFmpeg, path: Path) -> float:
+    """Quick header-only lookup of the video stream duration (for items probed by older versions)."""
+    if not ff.ffprobe:
+        return 0.0
+    rc, out, _ = run_capture([ff.ffprobe, "-v", "error", "-select_streams", "V:0", "-show_entries",
+                              "stream=duration:stream_tags=DURATION", "-of", "json", long_path(path)], timeout=20)
+    if rc != 0:
+        return 0.0
+    with contextlib.suppress(ValueError, IndexError, TypeError):
+        return _stream_duration(json.loads(out.decode() or "{}")["streams"][0])
+    return 0.0
+
+
 def normalise_probe(data: dict[str, Any], path: Path | None = None) -> dict[str, Any]:
     fmt = data.get("format", {}) or {}
     streams = data.get("streams", []) or []
@@ -1724,6 +1747,7 @@ def normalise_probe(data: dict[str, Any], path: Path | None = None) -> dict[str,
                 "height": st.get("height") or 0, "fps": _frac(st.get("avg_frame_rate") or st.get("r_frame_rate")),
                 "hdr": hdr, "rotation": rot, "sar": sar, "bitrate": int(_frac(st.get("bit_rate"))),
                 "codec_tag": st.get("codec_tag_string"),
+                "duration": _stream_duration(st),
             }
         elif ct == "audio":
             res["audio"].append({
@@ -1755,14 +1779,15 @@ def normalise_probe(data: dict[str, Any], path: Path | None = None) -> dict[str,
     return res
 
 
-def keyframe_table(ff: FFmpeg, path: Path, cache: Path, timeout: float = 600) -> list[float] | None:
+def keyframe_table(ff: FFmpeg, path: Path, cache: Path, timeout: float = 600,
+                   stream: str = "V:0") -> list[float] | None:
     """Return video keyframe times (seconds, relative to start_time), cached on disk."""
     if cache.exists():
         with contextlib.suppress(ValueError, OSError):
             return json.loads(cache.read_text())
     if not ff.ffprobe:
         return None
-    rc, out, _ = run_capture([ff.ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries",
+    rc, out, _ = run_capture([ff.ffprobe, "-v", "error", "-select_streams", stream, "-show_entries",
                               "packet=pts_time,flags", "-of", "csv=p=0", long_path(path)],
                              timeout=timeout, low_priority=True)
     if rc != 0:
@@ -3690,6 +3715,8 @@ def codec_string(v: dict[str, Any] | None, mode: str | None, out_h: int) -> str:
 def audio_codec_string(codec: str, mode: str) -> str:
     if mode == "aac":
         return "mp4a.40.2"
+    if mode in ("ac3", "eac3"):
+        return "ac-3" if mode == "ac3" else "ec-3"
     return {"aac": "mp4a.40.2", "ac3": "ac-3", "eac3": "ec-3", "mp3": "mp4a.40.34", "opus": "opus",
             "flac": "fLaC"}.get(codec, "mp4a.40.2")
 
@@ -3905,6 +3932,10 @@ class HlsSession:
         self.sw_fallback = False
         self.error: str | None = None
         self.duration = float(info.get("duration") or 0)
+        # the video playlist must end where the *video* ends: when audio runs longer, segments past the last frame
+        # would be empty and the player stalls at the end (and never reaches the next episode)
+        vd = float((info.get("video") or {}).get("duration") or 0)
+        self.vduration = vd if 1.0 < vd < self.duration - 0.5 else self.duration
         self.video_mode = decision.get("videoMode")
         self.audio = info.get("audio") or []
         self.gops: list[float] = []
@@ -3930,12 +3961,12 @@ class HlsSession:
             st = float(self.info.get("start_time") or 0)
             rel = sorted({round(max(0.0, k - st), 6) for k in kfs if k - st >= -0.05}) or [0.0]
             rel[0] = 0.0
-            self.vsegs, self.groups = build_keyframe_segments(rel, self.duration)
+            self.vsegs, self.groups = build_keyframe_segments(rel, self.vduration)
             self.gops = rel
             gaps = [b - a for a, b in zip(self.gops, self.gops[1:]) if b - a > 0.0005]
             self.gop_time = max(0.005, min(0.5, (min(gaps) if gaps else 1.0) * 0.5))
         elif self.video_mode == "transcode":
-            self.vsegs = build_fixed_segments(self.duration, TRANSCODE_SEG)
+            self.vsegs = build_fixed_segments(self.vduration, TRANSCODE_SEG)
 
     # --- playlists ----------------------------------------------------------
     def master(self, text_subs: list[dict[str, Any]]) -> str:
@@ -4002,14 +4033,23 @@ class HlsSession:
         return max(500_000, int((self.info.get("bitrate") or 4_000_000) * 1.1))
 
     def audio_mode(self, sidx: int) -> str:
+        """Output codec for an audio rendition: ``aac`` (default) or ``ac3``/``eac3`` for surround passthrough.
+
+        Audio is always (cheaply) re-encoded rather than stream-copied: a copied track starts at the container's
+        seek point instead of the requested time, which shifts its timestamps after any resume/seek and leaves
+        the player waiting for audio forever ("Preparing… 99%"). Re-encoding trims sample-accurately.
+        """
         a = self.audio[sidx] if 0 <= sidx < len(self.audio) else {}
         codec = (a.get("codec") or "").lower()
-        if codec == "aac":
-            return "copy"
         if codec in PASSTHROUGH_AUDIO and self.manager.app.setting("allow_passthrough") and \
-                codec in (self.decision.get("clientAudio") or []):
-            return "copy"
+                codec in (self.decision.get("clientAudio") or []) and codec in self.manager.app.ff.encoders:
+            return codec
         return "aac"
+
+    def _vmap(self) -> str:
+        """Stream specifier of the real video stream (``0:v:0`` can be embedded cover art in some files)."""
+        idx = (self.info.get("video") or {}).get("index")
+        return f"0:{idx}" if isinstance(idx, int) else "0:V:0"  # V = video that isn't an attached picture
 
     def video_playlist(self) -> str:
         return media_playlist(self.vsegs, "init_video.mp4", lambda i: f"seg_video_{i}.m4s")
@@ -4084,7 +4124,7 @@ class HlsSession:
             jobn = f"{gop_start}"
             args = self._base(t)
             args += ["-ss", f"{t + eps:.6f}", "-i", long_path(self.path),
-                     "-map", "0:v:0", "-an", "-sn", "-dn", "-c:v", "copy"]
+                     "-map", self._vmap(), "-an", "-sn", "-dn", "-c:v", "copy"]
             if (self.info.get("video") or {}).get("codec") == "hevc":
                 args += ["-tag:v", "hvc1"]
             args += ["-fflags", "+genpts", "-avoid_negative_ts", "make_non_negative", "-output_ts_offset", f"{t:.6f}",
@@ -4099,9 +4139,10 @@ class HlsSession:
         args += ["-i", long_path(self.path)]
         burn = self.decision.get("burnSubtitle")
         if burn is not None:
-            args += ["-filter_complex", f"[0:v:0][0:s:{burn}]overlay=eof_action=pass[ov];[ov]{vf}[v]", "-map", "[v]"]
+            args += ["-filter_complex", f"[{self._vmap()}][0:s:{burn}]overlay=eof_action=pass[ov];[ov]{vf}[v]",
+                     "-map", "[v]"]
         else:
-            args += ["-map", "0:v:0", "-vf", vf]
+            args += ["-map", self._vmap(), "-vf", vf]
         args += ["-an", "-sn", "-dn"] + enc
         args += ["-avoid_negative_ts", "make_non_negative", "-output_ts_offset", f"{t:.6f}", "-max_muxing_queue_size", "4096"]
         args += self._hls_out(outdir, "seg", seg, TRANSCODE_SEG, f"init_{seg}{'sw' if sw else ''}.mp4")
@@ -4116,16 +4157,16 @@ class HlsSession:
         args += ["-i", long_path(self.path), "-map", f"0:a:{k}", "-vn", "-sn", "-dn"]
         mode = self.audio_mode(k)
         a = self.audio[k] if k < len(self.audio) else {}
-        if mode == "copy":
-            args += ["-c:a", "copy"]
+        ch = a.get("channels") or 2
+        if mode in ("ac3", "eac3"):
+            args += ["-c:a", mode, "-b:a", "640k" if ch > 2 else "224k"]
+        elif self.manager.app.setting("downmix_stereo") or ch <= 2:
+            args += ["-c:a", "aac", "-b:a", "192k", "-ac", "2"]
         else:
-            ch = a.get("channels") or 2
-            if self.manager.app.setting("downmix_stereo") or ch <= 2:
-                args += ["-c:a", "aac", "-b:a", "192k", "-ac", "2"]
-            else:
-                args += ["-c:a", "aac", "-b:a", "384k", "-ac", str(min(ch, 6))]
-            # first_pts=0 only after a seek: from the start, keep the track's own offset (A/V sync)
-            args += ["-af", "aresample=async=1:first_pts=0" if t > 0 else "aresample=async=1"]
+            args += ["-c:a", "aac", "-b:a", "384k", "-ac", str(min(ch, 6))]
+        # first_pts=0 pads a late-starting track with silence (keeps A/V sync) so audio always covers the
+        # segment from its first sample — otherwise the player has to skip the audio-less start
+        args += ["-af", "aresample=async=1:first_pts=0"]
         if a.get("lang"):
             args += ["-metadata:s:a:0", f"language={a['lang']}"]
         args += ["-avoid_negative_ts", "make_non_negative", "-output_ts_offset", f"{t:.6f}"]
@@ -4150,9 +4191,10 @@ class HlsSession:
         burn = self.decision.get("burnSubtitle")
         if self.info.get("video"):
             if self.video_mode == "transcode" and burn is not None:
-                args += ["-filter_complex", f"[0:v:0][0:s:{burn}]overlay=eof_action=pass[ov];[ov]{vf}[v]", "-map", "[v]"]
+                args += ["-filter_complex", f"[{self._vmap()}][0:s:{burn}]overlay=eof_action=pass[ov];[ov]{vf}[v]",
+                         "-map", "[v]"]
             else:
-                args += ["-map", "0:v:0"]
+                args += ["-map", self._vmap()]
                 if self.video_mode == "transcode":
                     args += ["-vf", vf]
         a_idx = self.decision.get("audioIndex")
@@ -4165,8 +4207,9 @@ class HlsSession:
             if (self.info.get("video") or {}).get("codec") == "hevc":
                 args += ["-tag:v", "hvc1"]
         if a_idx is not None and self.audio:
-            if self.audio_mode(a_idx) == "copy":
-                args += ["-c:a", "copy"]
+            am = self.audio_mode(a_idx)
+            if am in ("ac3", "eac3"):
+                args += ["-c:a", am, "-b:a", "640k"]
             else:
                 args += ["-c:a", "aac", "-b:a", "192k", "-ac", "2", "-af", "aresample=async=1:first_pts=0"]
         args += ["-sn", "-dn", "-avoid_negative_ts", "make_zero", "-max_muxing_queue_size", "4096",
@@ -4422,6 +4465,9 @@ class HlsManager:
                 mode = "simple"
         if replace:
             self.stop_session(replace)
+        v = info.get("video")
+        if v is not None and "duration" not in v and self.app.ff.available:  # probed by an older version
+            v["duration"] = video_stream_duration(self.app.ff, path)
         s = HlsSession(self, item_id, path, info, decision, mode, start_time)
         s.prepare(kfs)
         with self.lock:
@@ -5167,7 +5213,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             raise HTTPError(403, "bad_origin", "Cross-origin request rejected")
 
     def is_admin(self) -> bool:
-        if is_loopback(self.ip):
+        if is_loopback(self.ip) or self.app.is_own_ip(self.ip):
             return True
         if not self.app.setting("require_password"):
             return True
@@ -5472,7 +5518,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             prof = dict(p) if p else None
         self.send_json({"required": self.app.auth.required, "authenticated": s is not None or not self.app.auth.required,
                         "profile": prof, "admin": self.is_admin(), "profilesEnabled": bool(self.app.setting("profiles_enabled")),
-                        "loopback": is_loopback(self.ip), "hasPassword": bool(self.app.db.kv_get("auth_hash")),
+                        "loopback": is_loopback(self.ip) or self.app.is_own_ip(self.ip), "hasPassword": bool(self.app.db.kv_get("auth_hash")),
                         "hasAdminPin": bool(self.app.db.kv_get("admin_pin_hash"))})
 
     @route("POST", r"/api/v1/auth/login", public=True)
@@ -6598,6 +6644,8 @@ class App:
         self._asset_v: dict[str, str] | None = None
         self._zc: Any = None
         self._restart_flag = False
+        self._own_ips: set[str] = set()
+        self._own_ips_at = 0.0
 
     # --- settings ---------------------------------------------------------------
     def setting(self, key: str) -> Any:
@@ -6636,6 +6684,17 @@ class App:
             if self.dev_web:
                 self._asset_v = {k: str(int(time.time())) for k in self._asset_v}
         return self._asset_v
+
+    def is_own_ip(self, ip: str) -> bool:
+        """True when a request comes from this machine itself (e.g. its browser opened the LAN URL)."""
+        now = time.time()
+        if now - self._own_ips_at > 60:
+            ips: set[str] = set(lan_ips())
+            with contextlib.suppress(OSError):
+                for info in socket.getaddrinfo(socket.gethostname(), None):
+                    ips.add(str(info[4][0]))
+            self._own_ips, self._own_ips_at = ips, now
+        return ip.split("%")[0].replace("::ffff:", "") in self._own_ips
 
     def urls(self) -> list[str]:
         scheme = "https" if self.tls else "http"
@@ -7340,6 +7399,11 @@ class TestSubtitles(unittest.TestCase):
         self.assertIn("<i>Hi</i>, there\nline2", v)
         self.assertIn("<c.cFF0000>Red</c>", v)
 
+    def test_stream_duration(self) -> None:
+        self.assertEqual(_stream_duration({"duration": "60.5"}), 60.5)
+        self.assertAlmostEqual(_stream_duration({"tags": {"DURATION": "01:02:03.500000000"}}), 3723.5)
+        self.assertEqual(_stream_duration({}), 0.0)
+
     def test_langs(self) -> None:
         self.assertGreaterEqual(len(set(LANGS.values())), 40)
         self.assertEqual(lang_name("hin"), "Hindi")
@@ -7574,11 +7638,16 @@ class TestServerAPI(unittest.TestCase):
         # audio rendition
         st, _, _apl = self.req(base + "/audio_1.m3u8", raw=True)
         self.assertEqual(st, 200)
-        st, _, _ainit = self.req(base + "/init_audio_1.mp4", raw=True)
+        st, _, ainit = self.req(base + "/init_audio_1.mp4", raw=True)
         self.assertEqual(st, 200)
         st, _, aseg = self.req(base + "/seg_audio_1_1.m4s", raw=True)
         self.assertEqual(st, 200)
         self.assertTrue(mp4_tfdt(aseg))
+        # regression ("stuck at 99 %"): an AAC track started mid-file must carry its real time (6 s), not 0
+        m = re.search(rb"mdhd", ainit)
+        ver = ainit[m.end()]
+        ats = struct.unpack(">I", ainit[m.end() + (20 if ver == 1 else 12): m.end() + (24 if ver == 1 else 16)])[0]
+        self.assertAlmostEqual(mp4_tfdt(aseg)[0] / ats, 6.0, delta=0.15)
         st, _, _ = self.req(f"/api/v1/hls/{pb['sessionId']}", "DELETE")
         self.assertEqual(st, 200)
 
@@ -7856,11 +7925,40 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _can_open_browser() -> bool:
-    if PLAT.is_termux or PLAT.is_docker:
+    if PLAT.is_docker:
         return False
-    if PLAT.is_linux and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
-        return PLAT.is_wsl
-    return True
+    # a headless Linux server / SSH session has no browser to open
+    return not (PLAT.is_linux and not PLAT.is_wsl and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")))
+
+
+def open_in_browser(url: str) -> bool:
+    """Open ``url`` in this device's default browser: Windows, macOS, Linux desktops, WSL (Windows browser)
+    and Android/Termux (also from inside proot-distro, through Termux's own launcher)."""
+    def spawn(cmd: list[str]) -> bool:
+        try:
+            subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             **popen_kwargs(False))
+            return True
+        except OSError:
+            return False
+
+    termux_bin = "/data/data/com.termux/files/usr/bin"
+    if PLAT.is_termux:
+        for cmd in (["termux-open-url", url], [f"{termux_bin}/termux-open-url", url],
+                    ["am", "start", "-a", "android.intent.action.VIEW", "-d", url],
+                    ["/system/bin/am", "start", "-a", "android.intent.action.VIEW", "-d", url]):
+            if (shutil.which(cmd[0]) or os.path.exists(cmd[0])) and spawn(cmd):
+                return True
+        return False
+    if PLAT.is_wsl:
+        for cmd in (["wslview", url], ["cmd.exe", "/c", "start", "", url.replace("&", "^&")],
+                    ["powershell.exe", "-NoProfile", "-Command", f"Start-Process '{url}'"]):
+            if shutil.which(cmd[0]) and spawn(cmd):
+                return True
+    try:
+        return bool(webbrowser.open(url, new=2))
+    except webbrowser.Error:
+        return False
 
 
 def cmd_serve(args: argparse.Namespace, paths: Paths) -> int:
@@ -7905,8 +8003,10 @@ def cmd_serve(args: argparse.Namespace, paths: Paths) -> int:
         with contextlib.suppress(OSError):
             subprocess.Popen(["termux-wake-lock"], **popen_kwargs(False))
     if not args.no_open and _can_open_browser():
-        url = f"{'https' if app.tls else 'http'}://localhost:{app.port}/" + ("?tv=1" if args.tv else "")
-        threading.Timer(1.0, lambda: webbrowser.open(url)).start()
+        # open the LAN address (the same one phones/TVs use), straight to the home page
+        base = (app.urls() or [f"{'https' if app.tls else 'http'}://localhost:{app.port}"])[0]
+        url = base + "/" + ("?tv=1" if args.tv else "") + "#/home"
+        threading.Timer(1.0, lambda: open_in_browser(url) or log.info("Open %s in a browser", url)).start()
     log.info("Serving on %s:%d", app.host, app.port)
     try:
         assert app.httpd
@@ -8118,7 +8218,7 @@ img{display:block;max-width:100%}
 :focus{outline:none}
 :focus-visible{outline:3px solid var(--accent);outline-offset:3px}
 .focus-ring:focus,html[data-tv] :focus{outline:3px solid var(--accent);outline-offset:3px}
-html[data-tv] *{cursor:none!important}
+html[data-tv][data-keynav] *{cursor:none!important}
 .hidden{display:none!important}
 
 /* boot */
@@ -8999,7 +9099,7 @@ var Nav = LF.Nav = {
   first: function (scope) {
     scope = scope || Nav.scope();
     var af = $('[data-autofocus]', scope); if (af && Nav.visible(af)) return Nav.focus(af);
-    var main = $('.p-bigplay, .hero .btn, .row .card, .who-p, .grid .card, .page .btn, .set-nav a.on', scope) || Nav.list(scope)[0];
+    var main = $('.p-bigplay, .hero .btn, .row .card, .who-p, .osk button, .grid .card, .page .btn, .set-nav a.on', scope) || Nav.list(scope)[0];
     if (main) Nav.focus(main);
   },
   focus: function (el) {
@@ -9024,10 +9124,13 @@ var Nav = LF.Nav = {
     Nav.list(scope).forEach(function (el) {
       if (el === cur) return;
       var r = el.getBoundingClientRect(), x = r.left + r.width / 2, y = r.top + r.height / 2, prim, sec, overlap;
-      if (dir === 'left') { if (r.right > cr.left + 4 && x >= cx - 1) return; prim = cr.left - r.right; overlap = !(r.bottom < cr.top || r.top > cr.bottom); sec = Math.abs(y - cy); }
-      else if (dir === 'right') { if (r.left < cr.right - 4 && x <= cx + 1) return; prim = r.left - cr.right; overlap = !(r.bottom < cr.top || r.top > cr.bottom); sec = Math.abs(y - cy); }
-      else if (dir === 'up') { if (r.bottom > cr.top + 4 && y >= cy - 1) return; prim = cr.top - r.bottom; overlap = !(r.right < cr.left || r.left > cr.right); sec = Math.abs(x - cx); }
-      else { if (r.top < cr.bottom - 4 && y <= cy + 1) return; prim = r.top - cr.bottom; overlap = !(r.right < cr.left || r.left > cr.right); sec = Math.abs(x - cx); }
+      /* a candidate must lie beyond the current element in that direction, or share its row/column with
+         its centre further along (a full-width bar in another row is never "to the right") */
+      var rowOv = !(r.bottom <= cr.top + 2 || r.top >= cr.bottom - 2), colOv = !(r.right <= cr.left + 2 || r.left >= cr.right - 2);
+      if (dir === 'left') { if (!(r.right <= cr.left + 4 || (rowOv && x < cx - 1))) return; prim = cr.left - r.right; overlap = rowOv; sec = Math.abs(y - cy); }
+      else if (dir === 'right') { if (!(r.left >= cr.right - 4 || (rowOv && x > cx + 1))) return; prim = r.left - cr.right; overlap = rowOv; sec = Math.abs(y - cy); }
+      else if (dir === 'up') { if (!(r.bottom <= cr.top + 4 || (colOv && y < cy - 1))) return; prim = cr.top - r.bottom; overlap = colOv; sec = Math.abs(x - cx); }
+      else { if (!(r.top >= cr.bottom - 4 || (colOv && y > cy + 1))) return; prim = r.top - cr.bottom; overlap = colOv; sec = Math.abs(x - cx); }
       var s = Math.max(0, prim) + (overlap ? sec * 0.3 : sec * 2 + 40);
       if (s < bestS) { bestS = s; best = el; }
     });
@@ -9046,7 +9149,7 @@ function keyName(e) {
   if (k === 'ArrowRight' || k === 'Right' || c === 39) return 'right';
   if (k === 'ArrowUp' || k === 'Up' || c === 38) return 'up';
   if (k === 'ArrowDown' || k === 'Down' || c === 40) return 'down';
-  if (k === 'Enter' || c === 13) return 'ok';
+  if (k === 'Enter' || k === 'Select' || k === 'Accept' || c === 13 || c === 23 || c === 29443) return 'ok';
   if (k === 'Escape' || k === 'Esc' || c === 27 || c === 10009 || c === 461 || k === 'GoBack' || k === 'BrowserBack' || (c === 8 && !isTyping()) || (c === 4 && !k)) return 'back';
   if (k === 'MediaPlayPause' || c === 10252 || c === 179) return 'playpause';
   if (k === 'MediaPlay' || c === 415) return 'play';
@@ -9105,24 +9208,27 @@ document.addEventListener('keydown', function (e) {
     return;
   }
   if (k === 'ok') {
+    /* Activate on key *press*, explicitly: some TV browsers never send keyup for OK and some don't turn
+       Enter into a click on custom controls. Native activation is prevented so nothing fires twice. */
     var c = document.activeElement;
-    if (c && c.classList && c.classList.contains('card')) {
-      /* OK opens on release; holding OK (TV long-press) opens quick actions instead */
-      e.preventDefault();
-      if (!e.repeat && !c._pressT) c._pressT = setTimeout(function () { c._pressT = null; c._longDone = true; quickActions(c); }, 600);
-      return;
-    }
-    if (c && c.getAttribute && c.getAttribute('role') === 'switch') { e.preventDefault(); c.click(); }
+    if (!c || c === document.body || c === document.documentElement) { e.preventDefault(); Nav.first(); return; }
+    if (isTyping() || c.tagName === 'SELECT' || c.tagName === 'TEXTAREA') return;  /* forms / native pickers */
+    if (c.tagName === 'INPUT' && !/^(checkbox|radio|button|submit|range)$/.test(c.type)) return;
+    e.preventDefault();
+    if (e.repeat) return;
+    if (c.tagName === 'INPUT' && c.type === 'range') return;
+    if (c.tagName === 'BUTTON' && c.type === 'submit' && c.form) { if (c.form.requestSubmit) c.form.requestSubmit(); else c.form.dispatchEvent(new Event('submit', { cancelable: true })); return; }
+    c.click();
+    return;
+  }
+  if ((e.key === 'ContextMenu' || e.keyCode === 93) && document.activeElement && document.activeElement.classList && document.activeElement.classList.contains('card')) {
+    e.preventDefault(); quickActions(document.activeElement); return;
   }
   if (e.key === '/' && !isTyping() && !(LF.Player && LF.Player.active())) { e.preventDefault(); go('search'); }
 });
-document.addEventListener('keyup', function (e) {
-  if (keyName(e) !== 'ok') return;
-  var c = document.activeElement;
-  if (!c || !c.classList || !c.classList.contains('card')) return;
-  if (c._pressT) { clearTimeout(c._pressT); c._pressT = null; go(c.getAttribute('href').slice(2)); }
-  else c._longDone = false;
-});
+/* TV: hide the mouse cursor only while the remote's arrow keys are in use (LG Magic Remote points with it) */
+document.addEventListener('keydown', function (e) { if (S.tv && /^Arrow/.test(e.key || '')) document.documentElement.setAttribute('data-keynav', '1'); }, true);
+document.addEventListener('mousemove', function () { document.documentElement.removeAttribute('data-keynav'); }, true);
 /* Gamepad D-pad (optional) */
 (function () {
   if (!navigator.getGamepads) return;
@@ -9588,7 +9694,7 @@ function osk(input, onChange) {
   var keys = 'abcdefghijklmnopqrstuvwxyz1234567890'.split('');
   var box = h('div.osk', { 'aria-label': 'On-screen keyboard' });
   function press(ch) { input.value += ch; onChange(); }
-  keys.forEach(function (k) { box.appendChild(h('button', { type: 'button', onclick: function () { press(k); } }, k.toUpperCase())); });
+  keys.forEach(function (k, i) { box.appendChild(h('button', { type: 'button', 'data-autofocus': i === 0 ? true : null, onclick: function () { press(k); } }, k.toUpperCase())); });
   box.appendChild(h('button.wide', { type: 'button', onclick: function () { press(' '); } }, '␣'));
   box.appendChild(h('button.wide', { type: 'button', onclick: function () { input.value = input.value.slice(0, -1); onChange(); } }, '⌫'));
   box.appendChild(h('button.wide', { type: 'button', onclick: function () { input.value = ''; onChange(); } }, '✕'));
@@ -10453,6 +10559,7 @@ function destroyHls() { if (P && P.hls) { try { P.hls.destroy(); } catch (e) { /
 function load(pb, start) {
   var first = !P.pb;
   P.pb = pb; P.offset = pb.timeOffset || 0; P.ended = false; P.netRetries = 0; P.pendingPos = start || 0;
+  P.loadAt = Date.now(); P.everPlayed = false;
   if (P.audioIndex === null || P.audioIndex === undefined) P.audioIndex = pb.audioIndex;
   if (pb.item) setTitle(pb.item);
   var selSub = pb.subtitleIndex === null || pb.subtitleIndex === undefined ? null : pb.subtitles.filter(function (x) { return x.index === pb.subtitleIndex; })[0];
@@ -10977,7 +11084,7 @@ function hidePreview() { if (P) P.els.preview.style.display = 'none'; }
 function wire() {
   var v = P.video, els = P.els, root = P.root;
   ['play', 'pause', 'volumechange'].forEach(function (ev) { v.addEventListener(ev, function () { updateButtons(); if (ev === 'pause' && !P.loading) { showUi(); report('paused'); } }); });
-  v.addEventListener('playing', function () { hideSpinner(); P.waitingSince = 0; P.mediaRetries = 0; P.restarts = 0; P.loading = false; P.pendingPos = null; showUi(); if (settings().auto_fullscreen && !LF.S.tv && !P.fsTried && !/Mobi/.test(navigator.userAgent)) { P.fsTried = true; if (!document.fullscreenElement) toggleFs(); } });
+  v.addEventListener('playing', function () { hideSpinner(); P.waitingSince = 0; P.everPlayed = true; P.mediaRetries = 0; P.restarts = 0; P.loading = false; P.pendingPos = null; showUi(); if (settings().auto_fullscreen && !LF.S.tv && !P.fsTried && !/Mobi/.test(navigator.userAgent)) { P.fsTried = true; if (!document.fullscreenElement) toggleFs(); } });
   v.addEventListener('waiting', function () { P.waitingSince = Date.now(); setTimeout(function () { if (P && P.waitingSince && Date.now() - P.waitingSince >= 350) spinner(P.pb && P.pb.method !== 'direct' ? t('p.preparing') : t('p.buffering')); }, 400); });
   v.addEventListener('canplay', function () { if (!v.paused) hideSpinner(); });
   v.addEventListener('seeked', function () { if (P && !P.loading) P.pendingPos = null; });
@@ -10991,6 +11098,18 @@ function wire() {
   });
   v.addEventListener('loadedmetadata', function () { tick(); updateButtons(); });
   P.reportT = setInterval(function () { if (P && !P.video.paused) report('playing'); }, 10000);
+  /* stall watchdog: never spin forever. If nothing plays for a while (start or mid-stream), switch to the next
+     safer method (direct → remux → transcode) or show the error screen with Retry / Try transcoding. */
+  P.stallT = setInterval(function () {
+    if (!P || !P.pb || $('.p-dialog', P.root) || $('.p-bigplay', P.root) || P.menu || document.hidden) return;
+    var limit = P.pb.method === 'transcode' ? 45000 : 25000, now = Date.now();
+    var startStall = !P.everPlayed && P.loadAt && now - P.loadAt > limit;
+    var midStall = P.everPlayed && P.waitingSince && now - P.waitingSince > limit;
+    if (!startStall && !midStall) return;
+    P.loadAt = now; P.waitingSince = 0;
+    if (P.hls) { try { P.hls.startLoad(); } catch (e) { /* ignore */ } }
+    fallbackOrError(t('p.error') + ' (stalled)');
+  }, 2000);
   P.rafT = setInterval(function () { if (P && !P.video.paused && P.cues.length) renderSubs(false); }, 200);
   if (window.WebKitPlaybackTargetAvailabilityEvent) v.addEventListener('webkitplaybacktargetavailabilitychanged', function (e) { els.b.air.classList.toggle('hidden', e.availability !== 'available'); });
   if (v.remote && v.remote.watchAvailability) v.remote.watchAvailability(function (a) { if (P && P.pb && P.pb.method === 'direct') els.b.cast.classList.toggle('hidden', !a); }).catch(function () { /* unsupported */ });
@@ -11182,9 +11301,11 @@ function onKey(e, k) {
 
 function onJob(d) {
   if (!P || !P.pb || d.sessionId !== P.pb.sessionId || !P.spinMsg || !$('.spinner', P.els.center)) return;
-  var target = pos(), seg = 6, pct = clamp(Math.round(((d.time - target + seg) / (seg * 2)) * 100), 1, 99);
+  var target = pos(), seg = 6, pct = clamp(Math.round(((d.time - target + seg) / (seg * 2)) * 100), 1, 100);
   if (d.time < target - 60) pct = clamp(Math.round((d.time % (seg * 2)) / (seg * 2) * 100), 1, 99);
-  var msg = $('.msg', P.els.center); if (msg) msg.textContent = t('p.preparingpct', pct) + (d.speed ? '  ·  ' + d.speed.toFixed(1) + '×' : '');
+  /* once the server is past the play position the wait is on the player side: say so instead of "99 %" */
+  var msg = $('.msg', P.els.center);
+  if (msg) msg.textContent = pct >= 95 ? t('p.buffering') : t('p.preparingpct', pct) + (d.speed ? '  ·  ' + d.speed.toFixed(1) + '×' : '');
 }
 function onTrick(d) { if (P && P.pb && d.id === P.id) api('/trickplay/' + P.id + '/index.json').then(function (ti) { ti.url = '/api/v1/trickplay/' + P.id + '/'; P.pb.trickplay = ti; }).catch(function () { /* not ready */ }); }
 
@@ -11192,7 +11313,7 @@ function teardown(silent, keepFs) {
   if (!P) return;
   var p = P;
   if (!p.ended) report('stopped');
-  clearInterval(p.reportT); clearInterval(p.rafT); clearInterval(p.countdown); clearTimeout(p.idleT);
+  clearInterval(p.reportT); clearInterval(p.stallT); clearInterval(p.rafT); clearInterval(p.countdown); clearTimeout(p.idleT);
   document.removeEventListener('visibilitychange', p.onVis);
   window.removeEventListener('pagehide', p.onHide);
   document.removeEventListener('fullscreenchange', p.onFs);
@@ -11229,7 +11350,7 @@ function close(fromRoute) {
     setTimeout(function () { if (focus && document.contains(focus)) LF.Nav.focus(focus); }, 60);
   }
 }
-LF.Player = { preload: preload, open: open, close: close, active: function () { return !!P; }, onKey: onKey, onJob: onJob, onTrick: onTrick, parseVTT: parseVTT, debug: function () { return P ? { pos: pos(), dur: dur(), cues: P.cues.length, subIndex: P.subIndex, audioIndex: P.audioIndex, offset: P.offset, pb: P.pb } : null; } };
+LF.Player = { preload: preload, open: open, close: close, active: function () { return !!P; }, onKey: onKey, onJob: onJob, onTrick: onTrick, parseVTT: parseVTT, debug: function () { return P ? { pos: pos(), dur: dur(), cues: P.cues.length, subIndex: P.subIndex, audioIndex: P.audioIndex, offset: P.offset, pb: P.pb, hls: P.hls } : null; } };
 })();
 
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', LF.ready); else LF.ready();
